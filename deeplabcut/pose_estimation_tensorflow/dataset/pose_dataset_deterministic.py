@@ -23,7 +23,7 @@ from numpy import array as arr
 from numpy import concatenate as cat
 
 import scipy.io as sio
-from scipy.misc import imread, imresize
+from deeplabcut.util.misc import imread, imresize
 
 from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import Batch, data_to_input, mirror_joints_map, CropImage, DataItem
 
