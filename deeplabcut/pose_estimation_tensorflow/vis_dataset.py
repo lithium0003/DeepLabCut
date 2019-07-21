@@ -5,7 +5,7 @@ https://github.com/eldar/pose-tensorflow
 
 import logging, os
 import numpy as np
-from deeplabcut.util.misc import imresize
+from deeplabcut.utils.misc import imresize
 import platform
 import matplotlib as mpl
 if os.environ.get('DLClight', default=False) == 'True':

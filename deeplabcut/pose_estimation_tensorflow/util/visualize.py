@@ -5,7 +5,7 @@ https://github.com/eldar/pose-tensorflow
 
 import math, os
 import numpy as np
-from deeplabcut.util.misc import imresize
+from deeplabcut.utils.misc import imresize
 
 import matplotlib
 import platform
