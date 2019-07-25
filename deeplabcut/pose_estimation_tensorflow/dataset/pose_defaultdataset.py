@@ -19,8 +19,29 @@ from numpy import concatenate as cat
 import scipy.io as sio
 from deeplabcut.utils.misc import imread, imresize
 
-from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import Batch, data_to_input, mirror_joints_map, CropImage, DataItem
+from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import Batch, data_to_input, mirror_joints_map, DataItem
 #from dataset.pose_dataset import Batch, data_to_input, mirror_joints_map, CropImage, DataItem
+
+def CropImage(joints,im,Xlabel,Ylabel,rand_param):
+    ''' Randomly cropping image around xlabel,ylabel taking into account size of image. Introduced in DLC 2 '''
+    widthforward=rand_param['widthforward']
+    widthback=rand_param['widthback']
+    hup=rand_param['hup']
+    hdown=rand_param['hdown']
+    Xstart=max(0,int(Xlabel)-widthback)
+    Xstop=min(np.shape(im)[1]-1,int(Xlabel)+widthforward)
+    Ystart=max(0,int(Ylabel)-hdown)
+    Ystop=min(np.shape(im)[0]-1,int(Ylabel)+hup)
+    joints[0,:,1]-=Xstart
+    joints[0,:,2]-=Ystart
+
+    inbounds=np.where((joints[0,:,1]>0)*(joints[0,:,1]<np.shape(im)[1])*(joints[0,:,2]>0)*(joints[0,:,2]<np.shape(im)[0]))[0]
+    croped_im = im[Ystart:Ystop+1,Xstart:Xstop+1,:]
+    if widthforward + widthback > croped_im.shape[1] or hup + hdown > croped_im.shape[0]:
+        pad_x = max(0, widthforward + widthback - croped_im.shape[1] + 1)
+        pad_y = max(0, hup + hdown - croped_im.shape[0] + 1)
+        croped_im = np.pad(croped_im, ((0, pad_y), (0, pad_x), (0, 0)), 'mean')
+    return joints[:,inbounds,:], croped_im
 
 class PoseDataset:
     def __init__(self, cfg):
@@ -133,16 +154,36 @@ class PoseDataset:
             scale *= scale_jitter
         return scale
 
-    def next_batch(self):
-        while True:
-            imidx, mirror = self.next_training_sample()
-            data_item = self.get_training_sample(imidx)
-            scale = self.get_scale()
+    def next_batch(self, batch_size=1):
+        for i in range(batch_size):
+            while True:
+                imidx, mirror = self.next_training_sample()
+                data_item = self.get_training_sample(imidx)
+                if i > 0:
+                    if im_width != data_item.im_size[2] or im_height != data_item.im_size[1]:
+                        continue
+                else:
+                    im_width = data_item.im_size[2]
+                    im_height = data_item.im_size[1]
+                    scale = self.get_scale()
+                    cfg = self.cfg
+                    rand_param = {
+                        'cropratio': np.random.rand(),
+                        'widthforward': int(cfg["minsize"]+np.random.randint(cfg["rightwidth"])),
+                        'widthback': int(cfg["minsize"]+np.random.randint(cfg["leftwidth"])),
+                        'hup': int(cfg["minsize"]+np.random.randint(cfg["topheight"])),
+                        'hdown': int(cfg["minsize"]+np.random.randint(cfg["bottomheight"]))
+                    }
 
-            if not self.is_valid_size(data_item.im_size, scale):
-                continue
-
-            return self.make_batch(data_item, scale, mirror)
+                if self.is_valid_size(data_item.im_size, scale):
+                    break
+            batch = self.make_batch(data_item, scale, mirror, rand_param)
+            batch.pop(Batch.data_item)
+            if i > 0:
+                batch_result = {k: np.concatenate([v, batch[k]], axis=0) for k, v in batch_result.items()}
+            else:
+                batch_result = batch
+        return batch_result
 
     def is_valid_size(self, image_size, scale):
         im_width = image_size[2]
@@ -161,7 +202,7 @@ class PoseDataset:
 
         return True
 
-    def make_batch(self, data_item, scale, mirror):
+    def make_batch(self, data_item, scale, mirror, rand_param):
         im_file = data_item.im_path
         logging.debug('image %s', im_file)
         logging.debug('mirror %r', mirror)
@@ -174,12 +215,12 @@ class PoseDataset:
             joints = np.copy(data_item.joints)
 
         if self.cfg.crop: #adapted cropping for DLC
-            if np.random.rand()<self.cfg.cropratio:
+            if rand_param['cropratio']<self.cfg.cropratio:
                 #1. get center of joints
                 j=np.random.randint(np.shape(joints)[1]) #pick a random joint
                 # draw random crop dimensions & subtract joint points
                 #print(joints,j,'ahah')
-                joints,image=CropImage(joints,image,joints[0,j,1],joints[0,j,2],self.cfg)
+                joints,image=CropImage(joints,image,joints[0,j,1],joints[0,j,2],rand_param)
                 
                 #if self.has_gt:
                 #    joints[0,:, 1] -= x0

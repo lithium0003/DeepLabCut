@@ -22,12 +22,14 @@ if int(vers[0])==1 and int(vers[1])>12:
 else:
     TF=tf
 import tensorflow.contrib.slim as slim
+import numpy as np
 
 from deeplabcut.pose_estimation_tensorflow.config import load_config
 from deeplabcut.pose_estimation_tensorflow.dataset.factory import create as create_dataset
 from deeplabcut.pose_estimation_tensorflow.nnet.net_factory import pose_net
 from deeplabcut.pose_estimation_tensorflow.nnet.pose_net import get_batch_spec
 from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
+from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import Batch
 
 class LearningRate(object):
     def __init__(self, cfg):
@@ -94,35 +96,15 @@ def get_optimizer(loss_op, cfg):
 def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
     start_path=os.getcwd()
     os.chdir(str(Path(config_yaml).parents[0])) #switch to folder of config_yaml (for logging)
+    TF.logging.set_verbosity(TF.logging.INFO)
     setup_logging()
 
     cfg = load_config(config_yaml)
-    cfg['batch_size']=1 #in case this was edited for analysis.
+    #cfg['batch_size']=1 #in case this was edited for analysis.
 
-    dataset = create_dataset(cfg)
-    batch_spec = get_batch_spec(cfg)
-    batch, enqueue_op, placeholders = setup_preloading(batch_spec)
-    losses = pose_net(cfg).train(batch)
-    total_loss = losses['total_loss']
+    if cfg.deterministic:
+        tf.set_random_seed(42)
 
-    for k, t in losses.items():
-        TF.summary.scalar(k, t)
-    merged_summaries = TF.summary.merge_all()
-
-    variables_to_restore = slim.get_variables_to_restore(include=["resnet_v1"])
-    restorer = TF.train.Saver(variables_to_restore)
-    saver = TF.train.Saver(max_to_keep=max_to_keep) # selects how many snapshots are stored, see https://github.com/AlexEMG/DeepLabCut/issues/8#issuecomment-387404835
-
-    sess = TF.Session()
-    coord, thread = start_preloading(sess, enqueue_op, dataset, placeholders)
-    train_writer = TF.summary.FileWriter(cfg.log_dir, sess.graph)
-    learning_rate, train_op = get_optimizer(total_loss, cfg)
-
-    sess.run(TF.global_variables_initializer())
-    sess.run(TF.local_variables_initializer())
-
-    # Restore variables from disk.
-    restorer.restore(sess, cfg.init_weights)
     if maxiters==None:
         max_iter = int(cfg.multi_step[-1][1])
     else:
@@ -143,39 +125,88 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
         save_iters=max(1,int(saveiters))
         print("Save_iters overwritten as",save_iters)
 
-    cum_loss = 0.0
-    lr_gen = LearningRate(cfg)
+    model_fn = lambda features, labels, mode, params: pose_net(cfg).model_fn(features, labels, mode, params)
 
-    stats_path = Path(config_yaml).with_name('learning_stats.csv')
-    lrf = open(str(stats_path), 'w')
+    trainpath=str(config_yaml).split('pose_cfg.yaml')[0]
+    # Check which snapshots are available and sort them by # iterations
+    Snapshots = [fn.split('.')[0]for fn in os.listdir(trainpath)if "index" in fn]
+    try: #check if any where found?
+        Snapshots[0]
+        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=trainpath)
+    except IndexError:
+        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=cfg.init_weights, vars_to_warm_start='resnet.*')
+
+    session_config = TF.ConfigProto(
+            gpu_options=tf.GPUOptions(
+                allow_growth=True
+            )
+    )
+    run_config = TF.estimator.RunConfig(
+            session_config=session_config,
+            save_checkpoints_steps=None,
+            save_checkpoints_secs=5*60,
+            keep_checkpoint_max=max_to_keep)
+
+    dlc = tf.estimator.Estimator(
+            model_fn=model_fn, 
+            model_dir=trainpath,
+            params={},
+            config=run_config,
+            warm_start_from=warm_start_settings)
+
+    #stats_path = Path(config_yaml).with_name('learning_stats.csv')
+    #lrf = open(str(stats_path), 'w')
 
     print("Training parameter:")
     print(cfg)
     print("Starting training....")
-    for it in range(max_iter+1):
-        current_lr = lr_gen.get_lr(it)
-        [_, loss_val, summary] = sess.run([train_op, total_loss, merged_summaries],
-                                          feed_dict={learning_rate: current_lr})
-        cum_loss += loss_val
-        train_writer.add_summary(summary, it)
 
-        if it % display_iters == 0 and it>0:
-            average_loss = cum_loss / display_iters
-            cum_loss = 0.0
-            logging.info("iteration: {} loss: {} lr: {}"
-                         .format(it, "{0:.4f}".format(average_loss), current_lr))
-            lrf.write("{}, {:.5f}, {}\n".format(it, average_loss, current_lr))
-            lrf.flush()
+    dataset = create_dataset(cfg)
+    def data_generator():
+        while True:
+            batch_np = dataset.next_batch(cfg.batch_size)
+            feature = batch_np[Batch.inputs]
+            labels = (
+                    batch_np[Batch.part_score_targets],
+                    batch_np[Batch.part_score_weights],
+                    batch_np[Batch.locref_targets],
+                    batch_np[Batch.locref_mask]
+                    )
+            yield (feature, labels)
 
-        # Save snapshot
-        if (it % save_iters == 0 and it != 0) or it == max_iter:
-            model_name = cfg.snapshot_prefix
-            saver.save(sess, model_name, global_step=it)
+    def get_batch_shape(cfg):
+        batch_size = cfg.batch_size
+        num_joints = cfg.num_joints
+        return (TF.TensorShape([batch_size, None, None, 3]),
+                (
+                    TF.TensorShape([batch_size, None, None, num_joints]),
+                    TF.TensorShape([batch_size, None, None, num_joints]),
+                    TF.TensorShape([batch_size, None, None, num_joints * 2]),
+                    TF.TensorShape([batch_size, None, None, num_joints * 2])
+                )
+        )
 
-    lrf.close()
-    sess.close()
-    coord.request_stop()
-    coord.join([thread])
+    def train_input_fn():
+        data = TF.data.Dataset.from_generator(data_generator, 
+                (tf.float32,
+                    (tf.float32,
+                     tf.float32,
+                     tf.float32,
+                     tf.float32
+                    )
+                ),
+                get_batch_shape(cfg))
+        data = data.map(lambda f,l: (f, {
+            'part_score_targets': l[0], 
+            'part_score_weights': l[1],
+            'locref_targets': l[2],
+            'locref_mask': l[3]}))
+        data = data.prefetch(8)
+        return data
+
+    dlc.train(input_fn=train_input_fn, max_steps=max_iter)
+
+    #lrf.close()
     #return to original path.
     os.chdir(str(start_path))
 

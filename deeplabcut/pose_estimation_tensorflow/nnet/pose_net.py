@@ -94,24 +94,22 @@ class PoseNet:
         net, end_points = self.extract_features(inputs)
         return self.prediction_layers(net, end_points)
 
-    def test(self, inputs):
-        heads = self.get_net(inputs)
-        prob = tf.sigmoid(heads['part_pred'])
-        return {'part_prob': prob, 'locref': heads['locref']}
-
-    def train(self, batch):
+    def model_fn(self, features, labels, mode, params):
         cfg = self.cfg
+        heads = self.get_net(features)
+        predictions = {
+            'part_prob': tf.sigmoid(heads['part_pred']), 
+            'locref': heads['locref']
+        }
 
-        if cfg.deterministic:
-            tf.set_random_seed(42)
-
-        heads = self.get_net(batch[Batch.inputs])
+        if mode == tf.estimator.ModeKeys.PREDICT:
+            return tf.estimator.EstimatorSpec(mode, predictions=predictions)
 
         weigh_part_predictions = cfg.weigh_part_predictions
-        part_score_weights = batch[Batch.part_score_weights] if weigh_part_predictions else 1.0
+        part_score_weights = labels['part_score_weights'] if weigh_part_predictions else 1.0
 
         def add_part_loss(pred_layer):
-            return TF.losses.sigmoid_cross_entropy(batch[Batch.part_score_targets],
+            return TF.losses.sigmoid_cross_entropy(labels['part_score_targets'],
                                                    heads[pred_layer],
                                                    part_score_weights)
 
@@ -124,8 +122,8 @@ class PoseNet:
 
         if cfg.location_refinement:
             locref_pred = heads['locref']
-            locref_targets = batch[Batch.locref_targets]
-            locref_weights = batch[Batch.locref_mask]
+            locref_targets = labels['locref_targets']
+            locref_weights = labels['locref_mask']
 
             loss_func = losses.huber_loss if cfg.locref_huber_loss else tf.losses.mean_squared_error
             loss['locref_loss'] = cfg.locref_loss_weight * loss_func(locref_targets, locref_pred, locref_weights)
@@ -133,4 +131,36 @@ class PoseNet:
 
         # loss['total_loss'] = slim.losses.get_total_loss(add_regularization_losses=params.regularize)
         loss['total_loss'] = total_loss
-        return loss
+
+        for k, t in loss.items():
+            TF.summary.scalar(k, t)
+        metrics = {'loss': TF.metrics.mean(total_loss)}
+
+        if mode == tf.estimator.ModeKeys.TRAIN:
+            global_step = TF.train.get_or_create_global_step()
+ 
+            steps = cfg.multi_step
+            vals = [s[0] for s in cfg.multi_step]
+            boundaries = [s[1] for s in cfg.multi_step]
+            vals += [vals[-1]]
+            learning_rate = TF.train.piecewise_constant(global_step, boundaries, vals)
+
+            TF.summary.scalar('learning_rate', learning_rate)
+
+            if cfg.optimizer == "sgd":
+                optimizer = TF.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
+            elif cfg.optimizer == "adam":
+                optimizer = TF.train.AdamOptimizer(cfg.adam_lr)
+            else:
+                raise ValueError('unknown optimizer {}'.format(cfg.optimizer))
+
+            train_op = slim.learning.create_train_op(total_loss, optimizer)
+        else:
+            train_op = None
+
+        return tf.estimator.EstimatorSpec(
+                mode=mode,
+                predictions=predictions,
+                loss=total_loss,
+                train_op=train_op,
+                eval_metric_ops=metrics)
