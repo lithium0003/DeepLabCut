@@ -3,7 +3,7 @@ Source: DeeperCut by Eldar Insafutdinov
 https://github.com/eldar/pose-tensorflow
 '''
 
-import re
+import re, os
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 from tensorflow.contrib.slim.nets import resnet_v1
@@ -95,15 +95,34 @@ class PoseNet:
         return self.prediction_layers(net, end_points)
 
     def model_fn(self, features, labels, mode, params):
+        tpu = os.getenv('TPU', default=False)
         cfg = self.cfg
+
         heads = self.get_net(features)
         predictions = {
-            'part_prob': tf.sigmoid(heads['part_pred']), 
+            'part_prob': tf.sigmoid(heads['part_pred']),
             'locref': heads['locref']
         }
 
+        if not tpu:
+            TF.summary.image('input', features)
+            show_label = tf.concat([
+                features[:,:,:,:2] / 255.,
+                tf.image.resize_bilinear(
+                    tf.expand_dims(labels['part_score_targets'][:,:,:,0], axis=3), 
+                    tf.shape(features)[1:3])],
+                axis=3)
+            TF.summary.image('label', show_label)
+            show_pred = tf.image.resize_bilinear(
+                    tf.expand_dims(predictions['part_prob'][:,:,:,0], axis=3), 
+                    tf.shape(features)[1:3])
+            TF.summary.image('predict', show_pred)
+
         if mode == tf.estimator.ModeKeys.PREDICT:
-            return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+            if tpu:
+                return TF.estimator.tpu.TPUEstimatorSpec(mode, predictions=predictions)
+            else:
+                return TF.estimator.EstimatorSpec(mode, predictions=predictions)
 
         weigh_part_predictions = cfg.weigh_part_predictions
         part_score_weights = labels['part_score_weights'] if weigh_part_predictions else 1.0
@@ -132,8 +151,9 @@ class PoseNet:
         # loss['total_loss'] = slim.losses.get_total_loss(add_regularization_losses=params.regularize)
         loss['total_loss'] = total_loss
 
-        for k, t in loss.items():
-            TF.summary.scalar(k, t)
+        if not tpu:
+            for k, t in loss.items():
+                TF.summary.scalar(k, t)
         metrics = {'loss': TF.metrics.mean(total_loss)}
 
         if mode == tf.estimator.ModeKeys.TRAIN:
@@ -145,7 +165,8 @@ class PoseNet:
             vals += [vals[-1]]
             learning_rate = TF.train.piecewise_constant(global_step, boundaries, vals)
 
-            TF.summary.scalar('learning_rate', learning_rate)
+            if not tpu:
+                TF.summary.scalar('learning_rate', learning_rate)
 
             if cfg.optimizer == "sgd":
                 optimizer = TF.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
@@ -154,13 +175,29 @@ class PoseNet:
             else:
                 raise ValueError('unknown optimizer {}'.format(cfg.optimizer))
 
+            if tpu:
+                optimizer = TF.tpu.CrossShardOptimizer(optimizer)
+
             train_op = slim.learning.create_train_op(total_loss, optimizer)
         else:
             train_op = None
 
-        return tf.estimator.EstimatorSpec(
-                mode=mode,
-                predictions=predictions,
-                loss=total_loss,
-                train_op=train_op,
-                eval_metric_ops=metrics)
+
+        if tpu:
+            if mode == tf.estimator.ModeKeys.EVAL:
+                def metric_fn(loss):
+                    return {'loss': TF.metrics.mean(loss)}
+
+                return TF.estimator.tpu.TPUEstimatorSpec(
+                        mode=mode, loss=loss, eval_metrics=(metric_fn, [total_loss]))
+
+            if mode == tf.estimator.ModeKeys.TRAIN:
+                return TF.estimator.tpu.TPUEstimatorSpec(
+                        mode=mode, loss=total_loss, train_op=train_op)
+        else:
+            return TF.estimator.EstimatorSpec(
+                    mode=mode,
+                    predictions=predictions,
+                    loss=total_loss,
+                    train_op=train_op,
+                    eval_metric_ops=metrics)

@@ -32,6 +32,7 @@ def create_config_template():
     \n
 # Project path (change when moving around)
     project_path:
+    train_base_path:
     \n
 # Annotation data set configuration (and individual video cropping parameters)
     video_sets:

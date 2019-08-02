@@ -35,8 +35,8 @@ def huber_loss(labels, predictions, weight=1.0, k=1.0, scope=None):
         predictions.get_shape().assert_is_compatible_with(labels.get_shape())
         if weight is None:
             raise ValueError("`weight` cannot be None")
-        predictions = math_ops.to_float(predictions)
-        labels = math_ops.to_float(labels)
+        predictions = tf.cast(predictions, tf.float32)
+        labels = tf.cast(labels, tf.float32)
         diff = math_ops.subtract(predictions, labels)
         abs_diff = tf.abs(diff)
         losses = tf.where(abs_diff < k,

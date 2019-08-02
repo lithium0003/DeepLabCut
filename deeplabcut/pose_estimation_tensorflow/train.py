@@ -94,6 +94,7 @@ def get_optimizer(loss_op, cfg):
     return learning_rate, train_op
 
 def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
+    tpu = os.getenv('TPU', False)
     start_path=os.getcwd()
     os.chdir(str(Path(config_yaml).parents[0])) #switch to folder of config_yaml (for logging)
     TF.logging.set_verbosity(TF.logging.INFO)
@@ -128,31 +129,54 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
     model_fn = lambda features, labels, mode, params: pose_net(cfg).model_fn(features, labels, mode, params)
 
     trainpath=str(config_yaml).split('pose_cfg.yaml')[0]
-    # Check which snapshots are available and sort them by # iterations
-    Snapshots = [fn.split('.')[0]for fn in os.listdir(trainpath)if "index" in fn]
-    try: #check if any where found?
-        Snapshots[0]
+    trainpath=trainpath.replace(cfg['project_path'],cfg['train_base_path'])
+    if len(tf.io.gfile.glob(os.path.join(trainpath,'*.index'))) > 0:
         warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=trainpath)
-    except IndexError:
-        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=cfg.init_weights, vars_to_warm_start='resnet.*')
+    else:
+        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=cfg.init_weights, 
+            vars_to_warm_start='resnet.*')
 
-    session_config = TF.ConfigProto(
-            gpu_options=tf.GPUOptions(
-                allow_growth=True
-            )
-    )
-    run_config = TF.estimator.RunConfig(
-            session_config=session_config,
-            save_checkpoints_steps=None,
-            save_checkpoints_secs=5*60,
-            keep_checkpoint_max=max_to_keep)
+    if tpu:
+        if os.getenv('COLAB_TPU_ADDR', None):
+            tpu_grpc_url = "grpc://"+os.environ["COLAB_TPU_ADDR"]
+            tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver(tpu_grpc_url)
+        else:
+            tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver()
 
-    dlc = tf.estimator.Estimator(
-            model_fn=model_fn, 
-            model_dir=trainpath,
-            params={},
-            config=run_config,
-            warm_start_from=warm_start_settings)
+    if tpu:
+        run_config = TF.estimator.tpu.RunConfig(
+                cluster=tpu_cluster_resolver,
+                session_config=tf.ConfigProto(
+                    allow_soft_placement=True, log_device_placement=True),
+                    tpu_config=TF.estimator.tpu.TPUConfig(
+                        iterations_per_loop='5m',
+                    ),
+                save_checkpoints_steps=None,
+                save_checkpoints_secs=5*60,
+                keep_checkpoint_max=max_to_keep)
+
+        dlc = tf.estimator.tpu.TPUEstimator(
+                model_fn=model_fn,
+                model_dir=trainpath,
+                use_tpu=True,
+                train_batch_size=cfg.batch_size*8,
+                eval_batch_size=cfg.batch_size*8,
+                predict_batch_size=cfg.batch_size*8,
+                params={},
+                config=run_config,
+                warm_start_from=warm_start_settings)
+    else:
+        run_config = TF.estimator.RunConfig(
+                save_checkpoints_steps=None,
+                save_checkpoints_secs=5*60,
+                keep_checkpoint_max=max_to_keep)
+
+        dlc = tf.estimator.Estimator(
+                model_fn=model_fn,
+                model_dir=trainpath,
+                params={},
+                config=run_config,
+                warm_start_from=warm_start_settings)
 
     #stats_path = Path(config_yaml).with_name('learning_stats.csv')
     #lrf = open(str(stats_path), 'w')
@@ -161,50 +185,15 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
     print(cfg)
     print("Starting training....")
 
-    dataset = create_dataset(cfg)
-    def data_generator():
-        while True:
-            batch_np = dataset.next_batch(cfg.batch_size)
-            feature = batch_np[Batch.inputs]
-            labels = (
-                    batch_np[Batch.part_score_targets],
-                    batch_np[Batch.part_score_weights],
-                    batch_np[Batch.locref_targets],
-                    batch_np[Batch.locref_mask]
-                    )
-            yield (feature, labels)
+    def train_input_fn(batch_size=1):
+        print('batch_size', batch_size)
+        dataset = create_dataset(cfg).load_dataset()
+        return dataset.batch(batch_size, drop_remainder=True).prefetch(batch_size*2)
 
-    def get_batch_shape(cfg):
-        batch_size = cfg.batch_size
-        num_joints = cfg.num_joints
-        return (TF.TensorShape([batch_size, None, None, 3]),
-                (
-                    TF.TensorShape([batch_size, None, None, num_joints]),
-                    TF.TensorShape([batch_size, None, None, num_joints]),
-                    TF.TensorShape([batch_size, None, None, num_joints * 2]),
-                    TF.TensorShape([batch_size, None, None, num_joints * 2])
-                )
-        )
-
-    def train_input_fn():
-        data = TF.data.Dataset.from_generator(data_generator, 
-                (tf.float32,
-                    (tf.float32,
-                     tf.float32,
-                     tf.float32,
-                     tf.float32
-                    )
-                ),
-                get_batch_shape(cfg))
-        data = data.map(lambda f,l: (f, {
-            'part_score_targets': l[0], 
-            'part_score_weights': l[1],
-            'locref_targets': l[2],
-            'locref_mask': l[3]}))
-        data = data.prefetch(8)
-        return data
-
-    dlc.train(input_fn=train_input_fn, max_steps=max_iter)
+    if tpu:
+        dlc.train(input_fn=lambda params: train_input_fn(params["batch_size"]), max_steps=max_iter)
+    else:
+        dlc.train(input_fn=lambda:train_input_fn(cfg.batch_size), max_steps=max_iter)
 
     #lrf.close()
     #return to original path.

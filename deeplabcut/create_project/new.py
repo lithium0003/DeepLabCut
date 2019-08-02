@@ -151,6 +151,7 @@ def create_new_project(project, experimenter, videos, working_directory=None, co
     cfg_file['scorer']=experimenter
     cfg_file['video_sets']=video_sets
     cfg_file['project_path']=str(project_path)
+    cfg_file['train_base_path']=str(project_path)
     cfg_file['date']=d
     cfg_file['bodyparts']=['bodypart1','bodypart2','bodypart3','objectA']
     cfg_file['cropping']=False

@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import os.path
 import matplotlib as mpl
+import glob
+import re
 
 import platform
 if os.environ.get('DLClight', default=False) == 'True':
@@ -28,6 +30,8 @@ from skimage import io
 import yaml
 from deeplabcut import DEBUG
 from deeplabcut.utils import auxiliaryfunctions, conversioncode, auxfun_models
+
+import tensorflow as tf
 
 #matplotlib.use('Agg')
 
@@ -477,7 +481,7 @@ def mergeandsplit(config,trainindex=0,uniform=True,windows2linux=False):
     return trainIndexes, testIndexes
 
 
-def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=False,trainIndexes=None,testIndexes=None):
+def create_training_dataset_org(config,num_shuffles=1,Shuffles=None,windows2linux=False,trainIndexes=None,testIndexes=None):
     """
     Creates a training dataset. Labels from all the extracted frames are merged into a single .h5 file.\n
     Only the videos included in the config file are used to create this dataset.\n
@@ -639,3 +643,121 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None,windows2linux=Fa
                 ]
                 MakeTest_pose_yaml(trainingdata, keys2save,path_test_config)
                 print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")
+
+def create_training_dataset(config,num_shuffles=1,Shuffles=None):
+    cfg = auxiliaryfunctions.read_config(config)
+    project_path = cfg['project_path']
+    trainbase_path = cfg['train_base_path']
+
+    bodyparts = cfg['bodyparts']
+    TrainingFraction = cfg['TrainingFraction']
+    bodypart_num = len(bodyparts)
+
+    net_type ='resnet_'+str(cfg['resnet'])
+    import deeplabcut
+    parent_path = Path(os.path.dirname(deeplabcut.__file__))
+    defaultconfigfile = str(parent_path / 'pose_cfg.yaml')
+
+    trainingsetfolder = auxiliaryfunctions.GetTrainingSetFolder(cfg) #Path concatenation OS platform independent
+    model_path,num_shuffles=auxfun_models.Check4weights(net_type,parent_path,num_shuffles)
+
+    # copy pretrained weight to trainging work space
+    pretrained_path = os.path.join(trainbase_path, 'pretrained', os.path.basename(model_path))
+    pretrained = tf.io.read_file(model_path)
+    writer = tf.io.write_file(pretrained_path, pretrained)
+    with tf.compat.v1.Session() as sess:
+        sess.run(writer)
+
+    if Shuffles==None:
+        Shuffles=range(1,num_shuffles+1,1)
+    else:
+        Shuffles=[i for i in Shuffles if isinstance(i,int)]
+
+    # copy image files to trainging work space
+    if project_path != trainbase_path:
+        with tf.compat.v1.Session() as sess:
+            labelfiles = glob.glob(os.path.join(project_path, 'labeled-data/*/CollectedData_%s.csv'%cfg['scorer']))
+            for labelfile in labelfiles:
+                image_files = glob.glob(os.path.join(os.path.dirname(labelfile),'img*.png'))
+                regex = re.compile(r'img\d+\.png$')
+                image_files = list(filter(regex.search, image_files))
+                for image_file in image_files:
+                    output_path = image_file.replace(os.path.join(project_path,'labeled-data'), os.path.join(trainbase_path,'labeled-data'))
+                    org_image = tf.io.read_file(image_file)
+                    writer = tf.io.write_file(output_path, org_image)
+                    sess.run(writer)
+
+    TrainingFraction = cfg['TrainingFraction']
+    for shuffle in Shuffles: # Creating shuffles starting from 1
+        for trainFraction in TrainingFraction:
+
+            files = tf.io.gfile.glob(os.path.join(project_path, 'labeled-data/*/CollectedData_%s.csv'%cfg['scorer']))
+            files_ds = tf.data.Dataset.from_tensor_slices(files)
+            csvdata = files_ds.interleave(lambda f: tf.data.TextLineDataset(f).skip(3), cycle_length=1)
+
+            def parse_line(line):
+              part = ['']
+              part += [tf.constant(float('nan'), dtype=tf.float32) for _ in range(bodypart_num * 2)]
+              fields = tf.io.decode_csv(line, part)
+              filename = tf.strings.regex_replace(fields[0],'\\\\','/')
+              bodypart = tf.reshape(fields[1:], [-1,2])
+              return filename, bodypart
+
+            def filter_item(filename, bodypart):
+              return tf.math.logical_not(tf.math.reduce_all(tf.math.reduce_any(tf.math.is_nan(bodypart), axis=1)))
+ 
+            data = csvdata.map(parse_line).filter(filter_item)
+            data = tf.compat.v1.data.make_one_shot_iterator(data)
+            data = data.get_next()
+
+            def make_example(filename, bodypart):
+              return tf.train.Example(features=tf.train.Features(feature={
+                  'filepath': tf.train.Feature(bytes_list=tf.train.BytesList(value=[filename])),
+                  'bodypart': tf.train.Feature(float_list=tf.train.FloatList(value=bodypart.flatten())),
+              }))
+
+            modelfoldername=auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)
+            path_train_config = str(os.path.join(project_path,Path(modelfoldername),'train','pose_cfg.yaml'))
+            path_test_config = str(os.path.join(project_path,Path(modelfoldername),'test','pose_cfg.yaml'))
+
+            datafn=os.path.join(str(trainingsetfolder) ,cfg["Task"] + "_" + cfg["scorer"] + str(int(100 * trainFraction)) + "shuffle" + str(shuffle))
+            test_record = os.path.join(trainbase_path, datafn, 'test.tfrecord')
+            train_record = os.path.join(trainbase_path, datafn, 'train.tfrecord')
+            if not trainbase_path.startswith('gs://'):
+                os.makedirs(os.path.join(trainbase_path, datafn), exist_ok=True)
+                os.makedirs(os.path.join(trainbase_path,Path(modelfoldername),'train'), exist_ok=True)
+                os.makedirs(os.path.join(trainbase_path,Path(modelfoldername),'test'), exist_ok=True)
+
+            with tf.io.TFRecordWriter(test_record) as writer2:
+              with tf.io.TFRecordWriter(train_record) as writer1:
+                with tf.compat.v1.Session() as sess:
+                  while True:
+                    try:
+                      filename, bodypart = sess.run(data)
+                      ex = make_example(filename, bodypart)
+                      if np.random.rand() < trainFraction:
+                        writer1.write(ex.SerializeToString())
+                      else:
+                        writer2.write(ex.SerializeToString())
+                    except tf.errors.OutOfRangeError:
+                      break
+
+            items2change = {
+                "train_set": train_record,
+                "test_set": test_record,
+                "num_joints": len(bodyparts),
+                "all_joints": [[i] for i in range(len(bodyparts))],
+                "all_joints_names": [str(bpt) for bpt in bodyparts],
+                "init_weights": pretrained_path,
+                "project_path": str(cfg['project_path']),
+                "train_base_path": str(cfg['train_base_path']),
+                "net_type": net_type
+            }
+            trainingdata = MakeTrain_pose_yaml(items2change,path_train_config,defaultconfigfile)
+            keys2save = [
+                "train_set", "test_set", "num_joints", "all_joints", "all_joints_names",
+                "net_type", 'init_weights', 'train_base_path', 'global_scale', 'location_refinement',
+                'locref_stdev'
+            ]
+            MakeTest_pose_yaml(trainingdata, keys2save,path_test_config)
+            print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")
