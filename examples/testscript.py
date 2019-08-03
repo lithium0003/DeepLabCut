@@ -147,13 +147,14 @@ deeplabcut.analyze_videos(path_config_file,[newvideo],destfolder=dfolder,croppin
 
 print("Extracting skeleton distances, filter and plot filtered output")
 deeplabcut.analyzeskeleton(path_config_file, [newvideo], save_as_csv=True, destfolder=dfolder)
+
 deeplabcut.filterpredictions(path_config_file,[newvideo])
+
 
 #deeplabcut.create_labeled_video(path_config_file,[newvideo], destfolder=dfolder,filtered=True)
 deeplabcut.create_labeled_video(path_config_file,[newvideo], destfolder=dfolder,displaycropped=True,filtered=True)
 
 deeplabcut.plot_trajectories(path_config_file,[newvideo], destfolder=dfolder,filtered=True)
-
 
 print("CREATING TRAININGSET for shuffle 2")
 print("will be used for 3D testscript...")
