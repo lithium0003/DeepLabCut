@@ -347,7 +347,7 @@ class PoseDataset:
             imex = tf.reshape(imex, [-1, channel])
 
             rotim = tf.where_v2(tf.tile(tf.expand_dims(tf.greater_equal(indexes, 0), axis=2), [1,1,channel]), 
-                    tf.gather(imex, tf.clip_by_value(indexes, 0, (height*expand-1)*(width*expand-1))),0)
+                    tf.gather(imex, tf.clip_by_value(indexes, 0, (height*expand-1)*(width*expand-1))), 127.)
 
             if expand != 1:
                 rotim = tf.image.resize_images(rotim, [height, width])
