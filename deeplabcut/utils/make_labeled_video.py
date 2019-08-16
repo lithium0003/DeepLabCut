@@ -24,6 +24,10 @@ from tqdm import tqdm
 import subprocess
 from pathlib import Path
 import platform
+import multiprocessing
+import threading
+import queue
+import cv2
 
 import matplotlib as mpl
 if os.environ.get('DLClight', default=False) == 'True':
@@ -46,7 +50,7 @@ def get_cmap(n, name='hsv'):
     RGB color; the keyword argument name must be a standard mpl colormap name.'''
     return plt.cm.get_cmap(name, n)
 
-def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,DLCscorer,bodyparts2plot,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped):
+def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,alphavalue,DLCscorer,bodyparts2plot,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped):
         ''' Creating individual frames with labeled body parts and making a video'''
         colorclass=plt.cm.ScalarMappable(cmap=colormap)
         C=colorclass.to_rgba(np.linspace(0,1,len(bodyparts2plot)))
@@ -85,13 +89,14 @@ def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,DLCscorer,bodyparts2plot
             else:
                 df_x[bpindex,:]=Dataframe[DLCscorer][bp]['x'].values
                 df_y[bpindex,:]=Dataframe[DLCscorer][bp]['y'].values
-        
-    
-        for index in tqdm(range(nframes)):
-            image = clip.load_frame()
+       
+        num_worker = max(1, multiprocessing.cpu_count() - 2)
+
+        def process_image(index, image):
             if displaycropped:
                     image=image[y1:y2,x1:x2]
-            
+           
+            frame = image.copy()
             for bpindex in range(len(bodyparts2plot)):
                 # Draw the skeleton for specific bodyparts to be connected as specified in the config file
                 if draw_skeleton:
@@ -99,22 +104,90 @@ def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,DLCscorer,bodyparts2plot
                         if (df_likelihood[pair[0],index] > pcutoff) and (df_likelihood[pair[1],index] >pcutoff):
 #                           rr, cc,val = line_aa(int(df_y[pair[0],index]),int(df_x[pair[0],index]),int(df_y[pair[1],index]), int(df_x[pair[1],index]))
                             rr, cc,val = line_aa(int(np.clip(df_y[pair[0],index],0,ny-1)),int(np.clip(df_x[pair[0],index],0,nx-1)), int(np.clip(df_y[pair[1],index],1,ny-1)), int(np.clip(df_x[pair[1],index],1,nx-1)))
-                            image[rr, cc,:] = color_for_skeleton
+                            image[rr, cc, :] = alphavalue * color_for_skeleton + (1-alphavalue) * image[rr, cc, :]
+                    frame = image.copy()
 
                 if df_likelihood[bpindex,index] > pcutoff:
                     if trailpoints>0: #plot history
-                        for k in range(min(trailpoints,index+1)):
-                            rr, cc = circle(df_y[bpindex,index-k],df_x[bpindex,index-k],dotsize,shape=(ny,nx))
-                            image[rr, cc, :] = colors[bpindex]
+                        for k in reversed(range(min(trailpoints,index+1))):
+                            xc = int(df_x[bpindex,index-k])
+                            yc = int(df_y[bpindex,index-k])
+                            rr, cc = circle(yc,xc,dotsize,shape=(ny,nx))
+                            a = alphavalue * (0.9 ** k)
+                            frame[rr, cc, :] = a * colors[bpindex] + (1 - a) * image[rr, cc, :]
+                        image = frame.copy()
                     else:
                         xc = int(df_x[bpindex,index])
                         yc = int(df_y[bpindex,index])
                         rr, cc = circle(yc,xc,dotsize,shape=(ny,nx))
-                        image[rr, cc, :] = colors[bpindex]
+                        a = alphavalue
+                        image[rr, cc, :] = a * colors[bpindex] + (1 - a) * image[rr, cc, :]
 
-            frame = image
-            clip.save_frame(frame)
-        clip.close()
+            return index, frame
+
+        def worker(qin, qout):
+            import signal
+
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                while True:
+                    item = qin.get()
+                    if item is None:
+                        break
+                    index, image = item
+                    index, image = process_image(index, image)
+                    qout.put((index, image))
+            except KeyboardInterrupt:
+                pass
+            finally:
+                qout.put(None)
+
+        def write_worker(qout, clip):
+            import signal
+
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            lastind = 0
+            try:
+                while True:
+                    item = qout[lastind % num_worker].get()
+                    if item is None:
+                        break
+                    index, frame = item
+                    assert index == lastind, 'index missmatch %d != %d'%(index, lastind)
+                    clip.save_frame(frame)
+                    lastind += 1
+            except KeyboardInterrupt:
+                pass
+            finally:
+                clip.close()
+
+        q_in = [multiprocessing.Queue(16) for i in range(num_worker)]
+        q_out = [multiprocessing.Queue(16) for i in range(num_worker)]
+        jobs = []
+        for i in range(num_worker):
+            p1 = multiprocessing.Process(target=worker, 
+                    args=(q_in[i], q_out[i]))
+            p1.start()
+            jobs.append(p1)
+        p = multiprocessing.Process(target=write_worker, args=(q_out, clip))
+        p.start()
+        
+        try:
+            for index in tqdm(range(nframes)):
+                image = clip.load_frame()
+                q_in[index % num_worker].put((index,image))
+
+        finally:
+            print('done.')
+
+            for q in q_in:
+                q.put(None)
+
+            for j in jobs:
+                j.join()
+
+            p.join()
+
 
 
 def CreateVideoSlow(videooutname,clip,Dataframe,tmpfolder,dotsize,colormap,alphavalue,pcutoff,trailpoints,cropping,x1,x2,y1,y2,delete,DLCscorer,bodyparts2plot,outputframerate,Frames2plot,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped):
@@ -397,11 +470,11 @@ def create_labeled_video(config,videos,videotype='avi',shuffle=1,trainingsetinde
                     CreateVideoSlow(videooutname,clip,Dataframe,tmpfolder,cfg["dotsize"],cfg["colormap"],cfg["alphavalue"],cfg["pcutoff"],trailpoints,cropping,x1,x2,y1,y2,delete,DLCscorer,bodyparts,outputframerate,Frames2plot,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped)
                 else:
                     if displaycropped: #then the cropped video + the labels is depicted
-                        clip = vp(fname = video,sname = videooutname,codec=codec,sw=x2-x1,sh=y2-y1)
-                        CreateVideo(clip,Dataframe,cfg["pcutoff"],cfg["dotsize"],cfg["colormap"],DLCscorer,bodyparts,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped)
+                        clip = vp(fname = video,sname = videooutname,codec=codec,sw=x2-x1,sh=y2-y1,create_video=False)
+                        CreateVideo(clip,Dataframe,cfg["pcutoff"],cfg["dotsize"],cfg["colormap"],cfg["alphavalue"],DLCscorer,bodyparts,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped)
                     else: #then the full video + the (perhaps in cropped mode analyzed labels) are depicted
-                        clip = vp(fname = video,sname = videooutname,codec=codec)
-                        CreateVideo(clip,Dataframe,cfg["pcutoff"],cfg["dotsize"],cfg["colormap"],DLCscorer,bodyparts,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped)
+                        clip = vp(fname = video,sname = videooutname,codec=codec,create_video=False)
+                        CreateVideo(clip,Dataframe,cfg["pcutoff"],cfg["dotsize"],cfg["colormap"],cfg["alphavalue"],DLCscorer,bodyparts,trailpoints,cropping,x1,x2,y1,y2,bodyparts2connect,skeleton_color,draw_skeleton,displaycropped)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

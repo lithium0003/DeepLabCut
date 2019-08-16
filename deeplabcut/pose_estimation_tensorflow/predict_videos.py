@@ -13,6 +13,7 @@ Licensed under GNU Lesser General Public License v3.0
 ####################################################
 
 import os.path
+from deeplabcut.pose_estimation_tensorflow.nnet.net_factory import pose_net
 from deeplabcut.pose_estimation_tensorflow.nnet import predict
 from deeplabcut.pose_estimation_tensorflow.config import load_config
 from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import data_to_input
@@ -24,9 +25,152 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 import tensorflow as tf
+vers = (tf.__version__).split('.')
+if int(vers[0])==1 and int(vers[1])>12:
+    TF=tf.compat.v1
+else:
+    TF=tf
 from deeplabcut.utils import auxiliaryfunctions
 import cv2
 from skimage.util import img_as_ubyte
+from PIL import Image
+import io
+
+def convert_analyze_videos(config,videos,dest,videotype='avi'):
+    start_path=os.getcwd() #record cwd to return to this directory in the end
+    cfg = auxiliaryfunctions.read_config(config)
+    
+    Videos=auxiliaryfunctions.Getlistofvideos(videos,videotype)
+
+    if len(Videos)>0:
+        #looping over videos
+        for video in Videos:
+            ConvertVideo(video,dest)
+
+        os.chdir(str(start_path))
+
+def ConvertVideo(video, dest):
+    import threading
+    import multiprocessing
+    from multiprocessing import Queue
+    import collections
+    import concurrent
+
+    cap=cv2.VideoCapture(video)
+    videoname = Path(video).stem
+    if tf.io.gfile.isdir(os.path.join(dest, videoname)):
+        print(os.path.join(dest, videoname))
+        print('converted directory exists, aborted.')
+        return
+
+    tf.io.gfile.makedirs(os.path.join(dest, videoname))
+
+    fps = cap.get(5) #https://docs.opencv.org/2.4/modules/highgui/doc/reading_and_writing_images_and_video.html#videocapture-get
+    nframes = int(cap.get(7))
+    duration=nframes*1./fps
+    size=(int(cap.get(4)),int(cap.get(3)))
+
+    ny,nx=size
+    print("Duration of video [s]: ", round(duration,2), ", recorded with ", round(fps,2),"fps!")
+    print("Overall # of frames: ", nframes," found with (before cropping) frame dimensions: ", nx,ny)
+
+    num_worker = max(1, multiprocessing.cpu_count()-2)
+    
+    def process_image(index, image):
+
+        def make_example(im_raw, width, height, i, nframes):        
+            return tf.train.Example(features=tf.train.Features(feature={      
+                'width': tf.train.Feature(int64_list=tf.train.Int64List(value=[width])),
+                'height': tf.train.Feature(int64_list=tf.train.Int64List(value=[height])),
+                'frame_no': tf.train.Feature(int64_list=tf.train.Int64List(value=[i])),
+                'nframes': tf.train.Feature(int64_list=tf.train.Int64List(value=[nframes])),
+                'im_raw': tf.train.Feature(bytes_list=tf.train.BytesList(value=[im_raw])),
+                }))
+
+        img_pil = Image.fromarray(image)
+        with io.BytesIO() as jpeg_im:
+            img_pil.save(jpeg_im, format='JPEG')
+            ex = make_example(jpeg_im.getvalue(), nx, ny, index, nframes)
+        return index, ex.SerializeToString()
+    
+    def worker(qin,qout,d):
+        try:
+            while True:
+                item = qin.get()
+                if item is None:
+                    break
+                index, image = item
+                assert index % num_worker == d, 'item worker %d not match %d'%(d,index)
+                index, ex = process_image(index, image)
+                qout.put((index, ex))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            #print('finish output buffer %d'%d)
+            qout.put(None)
+
+    def write_worker(qout,split):
+        writer = None
+        try:
+            i = 0
+            while True:
+                item = qout[i % num_worker].get()
+                if item is None:
+                    break
+                index, ex = item
+                assert index == i, 'index not match %d != %d'%(index, i)
+                
+                if index % split == 0:
+                    if writer:
+                        writer.close()
+                    filename = os.path.join(dest, videoname, 
+                            '%08d.tfrecord'%(index//split))
+                    #print('file %s'%filename)
+                    writer = tf.io.TFRecordWriter(filename) 
+                writer.write(ex)
+                i += 1
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if writer:
+                writer.close()
+
+    jobs = []
+    jobs2 = []
+    q_in = [Queue(100) for i in range(num_worker)]
+    q_out = [Queue(10000) for i in range(num_worker)]
+
+    for i in range(num_worker):
+        j1 = multiprocessing.Process(target=worker,args=(q_in[i],q_out[i],i))
+        j1.start()
+        jobs.append(j1)
+
+    j2 = multiprocessing.Process(target=write_worker,args=(q_out,50000))
+    j2.start()
+    jobs2.append(j2)
+
+    try:
+        for index in tqdm(range(nframes)):
+            ret, frame = cap.read()
+            if ret:
+                frame=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                q_in[index % num_worker].put((index, frame))
+            else:
+                break
+    finally:    
+        #print('finish input buffer')
+        for i in range(num_worker):
+            q_in[i].put(None)
+
+        print('wait input jobs')
+        for j in jobs:
+            j.join()
+
+        print('wait output jobs')
+        for j in jobs2:
+            j.join()
+        
+        print('done.')
 
 ####################################################
 # Loading data, and defining model folder
@@ -105,13 +249,11 @@ def analyze_videos(config,videos,videotype='avi',shuffle=1,trainingsetindex=0,gp
     if gputouse is not None: #gpu selection
             os.environ['CUDA_VISIBLE_DEVICES'] = str(gputouse)
 
-    vers = (tf.__version__).split('.')
-    if int(vers[0])==1 and int(vers[1])>12:
-        TF=tf.compat.v1
-    else:
-        TF=tf
+    TF.logging.set_verbosity(TF.logging.WARN)
 
-    TF.reset_default_graph()
+    if destfolder:
+        tf.io.gfile.makedirs(destfolder)
+
     start_path=os.getcwd() #record cwd to return to this directory in the end
 
     cfg = auxiliaryfunctions.read_config(config)
@@ -124,37 +266,49 @@ def analyze_videos(config,videos,videotype='avi',shuffle=1,trainingsetindex=0,gp
 
     trainFraction = cfg['TrainingFraction'][trainingsetindex]
 
-    modelfolder=os.path.join(cfg["project_path"],str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
+    project_path = cfg['project_path']
+    trainbase_path = cfg['train_base_path']
+    modelfolder=os.path.join(project_path,str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
+    tmodelfolder=os.path.join(trainbase_path,str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
     path_test_config = Path(modelfolder) / 'test' / 'pose_cfg.yaml'
     try:
         dlc_cfg = load_config(str(path_test_config))
     except FileNotFoundError:
         raise FileNotFoundError("It seems the model for shuffle %s and trainFraction %s does not exist."%(shuffle,trainFraction))
 
+    if project_path != trainbase_path:
+        print('copy to training folder...')
+        resultfrom_path = os.path.join(str(modelfolder), 'train')
+        resultto_path = resultfrom_path.replace(project_path, trainbase_path)
+        def cp(base):
+            for copy_file in tf.io.gfile.glob(os.path.join(base, '*')):
+                if tf.io.gfile.isdir(copy_file):
+                    output_path = copy_file.replace(project_path, trainbase_path)
+                    tf.io.gfile.makedirs(output_path)
+                    cp(copy_file)
+                else:
+                    output_path = copy_file.replace(project_path, trainbase_path)
+                    if not tf.io.gfile.exists(output_path):
+                        tf.io.gfile.copy(copy_file, output_path)
+        cp(resultfrom_path)
+
+    trainpath = os.path.join(str(modelfolder), 'train')
+    ttrainpath = os.path.join(str(tmodelfolder), 'train')
+    
     # Check which snapshots are available and sort them by # iterations
-    try:
-      Snapshots = np.array([fn.split('.')[0]for fn in os.listdir(os.path.join(modelfolder , 'train'))if "index" in fn])
-    except FileNotFoundError:
-      raise FileNotFoundError("Snapshots not found! It seems the dataset for shuffle %s has not been trained/does not exist.\n Please train it before using it to analyze videos.\n Use the function 'train_network' to train the network for shuffle %s."%(shuffle,shuffle))
-
-    if cfg['snapshotindex'] == 'all':
-        print("Snapshotindex is set to 'all' in the config.yaml file. Running video analysis with all snapshots is very costly! Use the function 'evaluate_network' to choose the best the snapshot. For now, changing snapshot index to -1!")
-        snapshotindex = -1
-    else:
-        snapshotindex=cfg['snapshotindex']
-
+    Snapshots = np.array([fn.split('.')[-2]for fn in os.listdir(trainpath) if "index" in fn])
     increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
     Snapshots = Snapshots[increasing_indices]
+    #dlc_cfg = read_config(os.path.join(modelfolder,'pose_cfg.yaml'))
+    #dlc_cfg['init_weights'] = os.path.join(modelfolder , 'train', Snapshots[snapshotindex])
+    SNP=Snapshots[-1]
+    trainingsiterations = (SNP.split(os.sep)[-1]).split('-')[-1]
 
-    print("Using %s" % Snapshots[snapshotindex], "for model", modelfolder)
+    print("Using %s" % trainingsiterations, "for model", tmodelfolder)
 
     ##################################################
     # Load and setup CNN part detector
     ##################################################
-
-    # Check if data already was generated:
-    dlc_cfg['init_weights'] = os.path.join(modelfolder , 'train', Snapshots[snapshotindex])
-    trainingsiterations = (dlc_cfg['init_weights'].split(os.sep)[-1]).split('-')[-1]
 
     #update batchsize (based on parameters in config.yaml)
     dlc_cfg['batch_size']=cfg['batch_size']
@@ -167,8 +321,6 @@ def analyze_videos(config,videos,videotype='avi',shuffle=1,trainingsetindex=0,gp
     # Name for scorer:
     DLCscorer = auxiliaryfunctions.GetScorerName(cfg,shuffle,trainFraction,trainingsiterations=trainingsiterations)
 
-    sess, inputs, outputs = predict.setup_pose_prediction(dlc_cfg)
-    
     xyz_labs_orig = ['x', 'y', 'likelihood']
     suffix = [str(s+1) for s in range(dlc_cfg['num_outputs'])]
     suffix[0] = '' # first one has empty suffix for backwards compatibility
@@ -187,7 +339,7 @@ def analyze_videos(config,videos,videotype='avi',shuffle=1,trainingsetindex=0,gp
     if len(Videos)>0:
         #looping over videos
         for video in Videos:
-            AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,sess,inputs, outputs,pdindex,save_as_csv, destfolder)
+            AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,ttrainpath,pdindex,save_as_csv, destfolder)
 
         os.chdir(str(start_path))
         print("The videos are analyzed. Now your research can truly start! \n You can create labeled videos with 'create_labeled_video'.")
@@ -199,6 +351,202 @@ def analyze_videos(config,videos,videotype='avi',shuffle=1,trainingsetindex=0,gp
     return DLCscorer
 
     
+def GetPose(cfg,dlc_cfg,dlc,cap,nframes,batchsize):
+    ''' Batchwise prediction of pose '''
+
+    import threading
+    import queue
+
+    PredicteData = np.zeros((nframes, dlc_cfg['num_outputs'] * 3 * len(dlc_cfg['all_joints_names'])))
+    ny,nx=int(cap.get(4)),int(cap.get(3))
+
+    if cfg['cropping']:
+        print("Cropping based on the x1 = %s x2 = %s y1 = %s y2 = %s. You can adjust the cropping coordinates in the config.yaml file." %(cfg['x1'], cfg['x2'],cfg['y1'], cfg['y2']))
+        nx=cfg['x2']-cfg['x1']
+        ny=cfg['y2']-cfg['y1']
+        if nx>0 and ny>0:
+            pass
+        else:
+            raise Exception('Please check the order of cropping parameter!')
+        if cfg['x1']>=0 and cfg['x2']<int(cap.get(3)+1) and cfg['y1']>=0 and cfg['y2']<int(cap.get(4)+1):
+            pass #good cropping box
+        else:
+            raise Exception('Please check the boundary of cropping!')
+
+    q = queue.Queue(4*dlc_cfg.batch_size)
+    def worker():
+        print('worker start')
+        def make_input():
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                im, count = item
+                yield im.astype(np.float32), 0
+                q.task_done()
+
+        def predict_input_fn(batch_size=1):
+            print('batch_size', batch_size)
+            dataset = tf.data.Dataset.from_generator(make_input, 
+                    (tf.float32,tf.float32), 
+                    (tf.TensorShape([ny,nx,3]), tf.TensorShape([])))
+            return dataset.batch(batch_size).prefetch(batch_size)
+
+        tpu = os.getenv('TPU', False)
+        if tpu:
+            predictions = dlc.predict(
+                    input_fn=lambda params: predict_input_fn(params["batch_size"]))
+        else:
+            predictions = dlc.predict(
+                    input_fn=lambda: predict_input_fn(dlc_cfg.batch_size))
+       
+        image_count = 0
+        try:
+            for predicted in predictions:
+                PredicteData[image_count, 0::3] = predicted['x'].flatten()
+                PredicteData[image_count, 1::3] = predicted['y'].flatten()
+                PredicteData[image_count, 2::3] = predicted['p'].flatten()
+                image_count += 1
+        except KeyboardInterrupt:
+            pass
+        print('worker_end')
+
+
+    t = threading.Thread(target=worker)
+    t.start()
+
+    pbar=tqdm(total=nframes)
+    counter = 0
+    try:
+        while(cap.isOpened()):
+            pbar.update(1)
+            ret, frame = cap.read()
+            if ret:
+                frame=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if cfg['cropping']:
+                    frame = img_as_ubyte(frame[cfg['y1']:cfg['y2'],cfg['x1']:cfg['x2']])
+                else:
+                    frame = img_as_ubyte(frame)
+                
+                q.put((frame, counter))
+            else:
+                nframes = counter
+                print("Detected frames: ", nframes)
+                break
+            counter += 1
+    except KeyboardInterrupt:
+        q.join()
+        # stop workers
+        q.put(None)
+        t.join()
+        pbar.close()
+        raise KeyboardInterrupt
+
+    # block until all tasks are done
+    q.join()
+    # stop workers
+    q.put(None)
+    t.join()
+
+    pbar.close()
+
+    return PredicteData[:nframes],nframes
+
+def copy_worker(temp_path, filepath):
+    dst = os.path.join(temp_path,Path(filepath).name)
+    tf.io.gfile.copy(filepath, dst)
+    print(dst)
+    return dst
+
+def GetPoseTFR(cfg,dlc_cfg,dlc,record_files,nx,ny,nframes,batchsize):
+    ''' Batchwise prediction of pose '''
+
+    import threading
+    import queue
+    import uuid
+    import re
+
+    tpu = os.getenv('TPU', False)
+    if tpu and not record_files[0].startswith('gs://'):
+        trainbase_path = cfg['train_base_path']
+        temp_path = os.path.join(trainbase_path, str(uuid.uuid4()))
+        tf.io.gfile.makedirs(temp_path)
+   
+        print('copy tfrecord files...')
+        with Pool(processes=8) as pool:
+            record_files = pool.starmap(copy_worker, zip([temp_path]*len(record_files), record_files))
+
+        print('copy done.')
+    else:
+        temp_path = None
+    record_files.sort()
+    PredicteData = np.zeros((nframes, dlc_cfg['num_outputs'] * 3 * len(dlc_cfg['all_joints_names'])))
+
+    if cfg['cropping']:
+        print("Cropping based on the x1 = %s x2 = %s y1 = %s y2 = %s. You can adjust the cropping coordinates in the config.yaml file." %(cfg['x1'], cfg['x2'],cfg['y1'], cfg['y2']))
+        nx=cfg['x2']-cfg['x1']
+        ny=cfg['y2']-cfg['y1']
+        if nx>0 and ny>0:
+            pass
+        else:
+            raise Exception('Please check the order of cropping parameter!')
+        if cfg['x1']>=0 and cfg['x2']<int(cap.get(3)+1) and cfg['y1']>=0 and cfg['y2']<int(cap.get(4)+1):
+            pass #good cropping box
+        else:
+            raise Exception('Please check the boundary of cropping!')
+
+    def predict_input_fn(batch_size=1):    
+        def read_tfrecord(serialized):
+            features = tf.io.parse_single_example(
+                serialized,
+                features={
+                    'width': tf.io.FixedLenFeature([], tf.int64),
+                    'height': tf.io.FixedLenFeature([], tf.int64),
+                    'frame_no': tf.io.FixedLenFeature([], tf.int64),
+                    'nframes': tf.io.FixedLenFeature([], tf.int64),
+                    'im_raw': tf.io.FixedLenFeature([], tf.string),
+                })
+            image = tf.io.decode_jpeg(features['im_raw'], channels=3)
+            image.set_shape([ny, nx, 3])
+            image = tf.image.convert_image_dtype(image, tf.float32) * 255.
+            return image, tf.constant(0, tf.float32)
+
+        dataset = (tf.data.Dataset.from_tensor_slices(record_files)
+                .flat_map(tf.data.TFRecordDataset)
+                .map(read_tfrecord, num_parallel_calls=batch_size*4)
+                .prefetch(10000))
+        dataset = dataset.batch(batch_size).prefetch(10000)
+        return dataset
+
+    if tpu:
+        predictions = dlc.predict(
+                input_fn=lambda params: predict_input_fn(params["batch_size"]))
+    else:
+        predictions = dlc.predict(
+                input_fn=lambda: predict_input_fn(dlc_cfg.batch_size))
+       
+    pbar=tqdm(total=nframes)
+    image_count = 0
+    try:
+        for predicted in predictions:
+            pbar.update(1)
+            if image_count < nframes:
+                PredicteData[image_count, 0::3] = predicted['x'].flatten()
+                PredicteData[image_count, 1::3] = predicted['y'].flatten()
+                PredicteData[image_count, 2::3] = predicted['p'].flatten()
+            else:
+                print('more frames detected. %d/%d'%(image_count, nframes))
+            image_count += 1
+    except KeyboardInterrupt:
+        pass
+
+    pbar.close()
+    if not temp_path is None:
+        tf.io.gfile.rmtree(temp_path)
+
+    return PredicteData[:nframes],nframes
+
+
 def GetPoseF(cfg,dlc_cfg, sess, inputs, outputs,cap,nframes,batchsize):
     ''' Batchwise prediction of pose '''
 
@@ -296,12 +644,19 @@ def GetPoseS(cfg,dlc_cfg, sess, inputs, outputs,cap,nframes):
     return PredicteData,nframes
 
 
-def AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,sess,inputs, outputs,pdindex,save_as_csv, destfolder=None):
+def AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,trainpath,pdindex,save_as_csv, destfolder=None):
     ''' Helper function for analyzing a video '''
     print("Starting to analyze % ", video)
-    vname = Path(video).stem
+    tf_record = video.endswith('.tfrecord')
+    if tf_record:
+        vname = Path(video).parents[0].stem
+    else:
+        vname = Path(video).stem
     if destfolder is None:
-        destfolder = str(Path(video).parents[0])
+        if tf_record:
+            destfolder = str(Path(video).parents[1])
+        else:
+            destfolder = str(Path(video).parents[0])
     dataname = os.path.join(destfolder,vname + DLCscorer + '.h5')
     try:
         # Attempt to load data...
@@ -309,23 +664,94 @@ def AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,sess,inputs, outputs,
         print("Video already analyzed!", dataname)
     except FileNotFoundError:
         print("Loading ", video)
-        cap=cv2.VideoCapture(video)
 
-        fps = cap.get(5) #https://docs.opencv.org/2.4/modules/highgui/doc/reading_and_writing_images_and_video.html#videocapture-get
-        nframes = int(cap.get(7))
-        duration=nframes*1./fps
-        size=(int(cap.get(4)),int(cap.get(3)))
+        if tf_record:
+            def read_tfrecord_size(serialized):
+                features = tf.io.parse_single_example(
+                    serialized,
+                    features={
+                        'width': tf.io.FixedLenFeature([], tf.int64),
+                        'height': tf.io.FixedLenFeature([], tf.int64),
+                        'frame_no': tf.io.FixedLenFeature([], tf.int64),
+                        'nframes': tf.io.FixedLenFeature([], tf.int64),
+                        'im_raw': tf.io.FixedLenFeature([], tf.string),
+                    })
+                return features['width'], features['height'], features['nframes']
 
-        ny,nx=size
-        print("Duration of video [s]: ", round(duration,2), ", recorded with ", round(fps,2),"fps!")
-        print("Overall # of frames: ", nframes," found with (before cropping) frame dimensions: ", nx,ny)
+            record_files = tf.io.gfile.glob(video)
+            dataset = tf.data.Dataset.from_tensor_slices(record_files).flat_map(tf.data.TFRecordDataset).map(read_tfrecord_size)
+            with TF.Session() as sess:
+                data = TF.data.make_one_shot_iterator(dataset).get_next()
+                nx, ny, nframes = sess.run(data)
+
+            print("Overall # of frames: ", nframes," found with (before cropping) frame dimensions: ", nx,ny)
+            fps = 0
+        else:
+            cap=cv2.VideoCapture(video)
+
+            fps = cap.get(5) #https://docs.opencv.org/2.4/modules/highgui/doc/reading_and_writing_images_and_video.html#videocapture-get
+            nframes = int(cap.get(7))
+            duration=nframes*1./fps
+            size=(int(cap.get(4)),int(cap.get(3)))
+
+            ny,nx=size
+            print("Duration of video [s]: ", round(duration,2), ", recorded with ", round(fps,2),"fps!")
+            print("Overall # of frames: ", nframes," found with (before cropping) frame dimensions: ", nx,ny)
+        
         start = time.time()
 
-        print("Starting to extract posture")
-        if int(dlc_cfg["batch_size"])>1:
-            PredicteData,nframes=GetPoseF(cfg,dlc_cfg, sess, inputs, outputs,cap,nframes,int(dlc_cfg["batch_size"]))
+        model_fn = lambda features, labels, mode, params: pose_net(dlc_cfg).model_fn(features, labels, mode, params)
+
+        tpu = os.getenv('TPU', False)
+        if tpu:
+            if os.getenv('COLAB_TPU_ADDR', None):
+                tpu_grpc_url = "grpc://"+os.environ["COLAB_TPU_ADDR"]
+                tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver(tpu_grpc_url)
+            else:
+                tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver()
+
+            run_config = TF.estimator.tpu.RunConfig(
+                    cluster=tpu_cluster_resolver,
+                    session_config=TF.ConfigProto(
+                        allow_soft_placement=True, log_device_placement=True),
+                        tpu_config=TF.estimator.tpu.TPUConfig(
+                            iterations_per_loop='2m',
+                        ),
+                    )
+            dlc = TF.estimator.tpu.TPUEstimator(
+                    model_fn=model_fn,
+                    model_dir=trainpath,
+                    use_tpu=True,
+                    train_batch_size=dlc_cfg.batch_size*8,
+                    eval_batch_size=dlc_cfg.batch_size*8,
+                    predict_batch_size=dlc_cfg.batch_size*8,
+                    params={
+                        'tpu': tpu,
+                        'width': nx,
+                        'height': ny,
+                        'stride': dlc_cfg.stride,
+                        'num_outputs': dlc_cfg['num_outputs'],
+                        },
+                    config=run_config)
         else:
-            PredicteData,nframes=GetPoseS(cfg,dlc_cfg, sess, inputs, outputs,cap,nframes)
+            dlc = TF.estimator.Estimator(
+                    model_fn=model_fn,
+                    model_dir=trainpath,
+                    params={
+                        'tpu': tpu,
+                        'width': nx,
+                        'height': ny,
+                        'stride': dlc_cfg.stride,
+                        'num_outputs': dlc_cfg['num_outputs'],
+                        },
+                    )
+
+        if tf_record:
+            print("Starting to extract posture")
+            PredicteData,nframes=GetPoseTFR(cfg,dlc_cfg,dlc,record_files,nx,ny,nframes,int(dlc_cfg["batch_size"]))
+        else:
+            print("Starting to extract posture")
+            PredicteData,nframes=GetPose(cfg,dlc_cfg,dlc,cap,nframes,int(dlc_cfg["batch_size"]))
 
         stop = time.time()
 
@@ -352,7 +778,7 @@ def AnalyzeVideo(video,DLCscorer,trainFraction,cfg,dlc_cfg,sess,inputs, outputs,
         }
         metadata = {'data': dictionary}
 
-        print("Saving results in %s..." %(Path(video).parents[0]))
+        print("Saving results in %s..." %(destfolder))
         auxiliaryfunctions.SaveData(PredicteData[:nframes,:], metadata, dataname, pdindex, range(nframes),save_as_csv)
 
 def GetPosesofFrames(cfg,dlc_cfg, sess, inputs, outputs,directory,framelist,nframes,batchsize,rgb):

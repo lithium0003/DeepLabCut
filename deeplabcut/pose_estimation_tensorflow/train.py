@@ -21,87 +21,43 @@ if int(vers[0])==1 and int(vers[1])>12:
     TF=tf.compat.v1
 else:
     TF=tf
-import tensorflow.contrib.slim as slim
-import numpy as np
 
 from deeplabcut.pose_estimation_tensorflow.config import load_config
 from deeplabcut.pose_estimation_tensorflow.dataset.factory import create as create_dataset
 from deeplabcut.pose_estimation_tensorflow.nnet.net_factory import pose_net
-from deeplabcut.pose_estimation_tensorflow.nnet.pose_net import get_batch_spec
-from deeplabcut.pose_estimation_tensorflow.util.logging import setup_logging
-from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import Batch
 
-class LearningRate(object):
-    def __init__(self, cfg):
-        self.steps = cfg.multi_step
-        self.current_step = 0
-
-    def get_lr(self, iteration):
-        lr = self.steps[self.current_step][0]
-        if iteration == self.steps[self.current_step][1]:
-            self.current_step += 1
-
-        return lr
-
-def setup_preloading(batch_spec):
-    placeholders = {name: TF.placeholder(tf.float32, shape=spec) for (name, spec) in batch_spec.items()}
-    names = placeholders.keys()
-    placeholders_list = list(placeholders.values())
-
-    QUEUE_SIZE = 20
-    vers = (tf.__version__).split('.')
-    if int(vers[0])==1 and int(vers[1])>12:
-        q = tf.queue.FIFOQueue(QUEUE_SIZE, [tf.float32]*len(batch_spec))
-    else:
-        q = tf.FIFOQueue(QUEUE_SIZE, [tf.float32]*len(batch_spec))
-    enqueue_op = q.enqueue(placeholders_list)
-    batch_list = q.dequeue()
-
-    batch = {}
-    for idx, name in enumerate(names):
-        batch[name] = batch_list[idx]
-        batch[name].set_shape(batch_spec[name])
-    return batch, enqueue_op, placeholders
-
-
-def load_and_enqueue(sess, enqueue_op, coord, dataset, placeholders):
-    while not coord.should_stop():
-        batch_np = dataset.next_batch()
-        food = {pl: batch_np[name] for (name, pl) in placeholders.items()}
-        sess.run(enqueue_op, feed_dict=food)
-
-
-def start_preloading(sess, enqueue_op, dataset, placeholders):
-    coord = TF.train.Coordinator()
-
-    t = threading.Thread(target=load_and_enqueue,
-                         args=(sess, enqueue_op, coord, dataset, placeholders))
-    t.start()
-
-    return coord, t
-
-def get_optimizer(loss_op, cfg):
-    learning_rate = TF.placeholder(tf.float32, shape=[])
-
-    if cfg.optimizer == "sgd":
-        optimizer = TF.train.MomentumOptimizer(learning_rate=learning_rate, momentum=0.9)
-    elif cfg.optimizer == "adam":
-        optimizer = TF.train.AdamOptimizer(cfg.adam_lr)
-    else:
-        raise ValueError('unknown optimizer {}'.format(cfg.optimizer))
-    train_op = slim.learning.create_train_op(loss_op, optimizer)
-
-    return learning_rate, train_op
 
 def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
     tpu = os.getenv('TPU', False)
     start_path=os.getcwd()
     os.chdir(str(Path(config_yaml).parents[0])) #switch to folder of config_yaml (for logging)
     TF.logging.set_verbosity(TF.logging.INFO)
-    setup_logging()
 
     cfg = load_config(config_yaml)
     #cfg['batch_size']=1 #in case this was edited for analysis.
+
+    project_path = cfg['project_path']
+    trainbase_path = cfg['train_base_path']
+    if project_path != trainbase_path:
+        print('copy to training folder...')
+        if not tf.io.gfile.exists(cfg['test_set']):
+            tf.io.gfile.copy(cfg['test_set'].replace(trainbase_path, project_path), cfg['test_set'])
+        if not tf.io.gfile.exists(cfg['train_set']):
+            tf.io.gfile.copy(cfg['train_set'].replace(trainbase_path, project_path), cfg['train_set'])
+        resultfrom_path = str(Path(config_yaml).parents[0])
+        resultto_path = resultfrom_path.replace(project_path, trainbase_path)
+        def cp(base):
+            for copy_file in tf.io.gfile.glob(os.path.join(base, '*')):
+                if tf.io.gfile.isdir(copy_file):
+                    output_path = copy_file.replace(project_path, trainbase_path)
+                    tf.io.gfile.makedirs(output_path)
+                    cp(copy_file)
+                else:
+                    output_path = copy_file.replace(project_path, trainbase_path)
+                    if not tf.io.gfile.exists(output_path):
+                        tf.io.gfile.copy(copy_file, output_path)
+        cp(resultfrom_path)
+
 
     if cfg.deterministic:
         tf.set_random_seed(42)
@@ -130,12 +86,12 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
 
     trainpath=str(config_yaml).split('pose_cfg.yaml')[0]
     trainpath=trainpath.replace(cfg['project_path'],cfg['train_base_path'])
-    if len(tf.io.gfile.glob(os.path.join(trainpath,'*.index'))) > 0:
-        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=trainpath)
-    else:
-        warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=cfg.init_weights, 
+    warm_start_settings = TF.estimator.WarmStartSettings(ckpt_to_initialize_from=cfg.init_weights, 
             vars_to_warm_start='resnet.*')
 
+    train_width = cfg['train_width']
+    train_height = cfg['train_height']
+    test_width, test_height, test_count = create_dataset(cfg).get_image_size('test')
     if tpu:
         if os.getenv('COLAB_TPU_ADDR', None):
             tpu_grpc_url = "grpc://"+os.environ["COLAB_TPU_ADDR"]
@@ -143,43 +99,77 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
         else:
             tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver()
 
-    if tpu:
         run_config = TF.estimator.tpu.RunConfig(
                 cluster=tpu_cluster_resolver,
-                session_config=tf.ConfigProto(
+                session_config=TF.ConfigProto(
                     allow_soft_placement=True, log_device_placement=True),
                     tpu_config=TF.estimator.tpu.TPUConfig(
-                        iterations_per_loop='5m',
+                        iterations_per_loop='2m',
                     ),
                 save_checkpoints_steps=None,
                 save_checkpoints_secs=5*60,
                 keep_checkpoint_max=max_to_keep)
 
-        dlc = tf.estimator.tpu.TPUEstimator(
+        dlc = TF.estimator.tpu.TPUEstimator(
                 model_fn=model_fn,
                 model_dir=trainpath,
                 use_tpu=True,
                 train_batch_size=cfg.batch_size*8,
                 eval_batch_size=cfg.batch_size*8,
                 predict_batch_size=cfg.batch_size*8,
-                params={},
+                params={
+                    'tpu': tpu,
+                    'width': train_width,
+                    'height': train_height,
+                    'stride': cfg.stride,
+                    'num_outputs': 1,
+                    },
                 config=run_config,
                 warm_start_from=warm_start_settings)
+        dlc_test = TF.estimator.tpu.TPUEstimator(
+                model_fn=model_fn,
+                model_dir=trainpath,
+                use_tpu=True,
+                train_batch_size=cfg.batch_size*8,
+                eval_batch_size=cfg.batch_size*8,
+                predict_batch_size=cfg.batch_size*8,
+                params={
+                    'tpu': tpu,
+                    'width': test_width,
+                    'height': test_height,
+                    'stride': cfg.stride,
+                    'num_outputs': 1,
+                    },
+                config=run_config)
     else:
         run_config = TF.estimator.RunConfig(
                 save_checkpoints_steps=None,
                 save_checkpoints_secs=5*60,
                 keep_checkpoint_max=max_to_keep)
 
-        dlc = tf.estimator.Estimator(
+        dlc = TF.estimator.Estimator(
                 model_fn=model_fn,
                 model_dir=trainpath,
-                params={},
+                params={
+                    'tpu': tpu,
+                    'width': train_width,
+                    'height': train_height,
+                    'stride': cfg.stride,
+                    'num_outputs': 1,
+                    },
                 config=run_config,
                 warm_start_from=warm_start_settings)
-
-    #stats_path = Path(config_yaml).with_name('learning_stats.csv')
-    #lrf = open(str(stats_path), 'w')
+        dlc_test = TF.estimator.Estimator(
+                model_fn=model_fn,
+                model_dir=trainpath,
+                params={
+                    'tpu': tpu,
+                    'width': test_width,
+                    'height': test_height,
+                    'stride': cfg.stride,
+                    'num_outputs': 1,
+                    },
+                config=run_config)
 
     print("Training parameter:")
     print(cfg)
@@ -187,15 +177,63 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
 
     def train_input_fn(batch_size=1):
         print('batch_size', batch_size)
-        dataset = create_dataset(cfg).load_dataset()
-        return dataset.batch(batch_size, drop_remainder=True).prefetch(batch_size*2)
+        dataset = create_dataset(cfg).load_training_dataset()
+        dataset = dataset.shuffle(1000).repeat()
+        return dataset.batch(batch_size, drop_remainder=True).prefetch(batch_size)
 
-    if tpu:
-        dlc.train(input_fn=lambda params: train_input_fn(params["batch_size"]), max_steps=max_iter)
+    def eval_input_fn(batch_size=1, width=-1, height=-1):
+        print('batch_size', batch_size)
+        dataset = create_dataset(cfg).load_eval_dataset(width, height, 'test')
+        dataset = dataset.shuffle(1000).repeat()
+        return dataset.batch(batch_size, drop_remainder=True).prefetch(batch_size)
+
+    eval_iter = 50000
+    lastckpt = dlc.latest_checkpoint()
+    if lastckpt:
+        last_num = (int(lastckpt.split('-')[-1]) - 1) // eval_iter * eval_iter
+        if last_num < 0:
+            last_num = 0
     else:
-        dlc.train(input_fn=lambda:train_input_fn(cfg.batch_size), max_steps=max_iter)
+        last_num = 0
 
-    #lrf.close()
+    try:
+        if tpu:
+            max_iter = max_iter // 4
+            r = list(range(last_num+eval_iter,max_iter,eval_iter))
+            r += [max_iter]
+            for i in sorted(r):
+                dlc.train(input_fn=lambda params: train_input_fn(params["batch_size"]), max_steps=i)
+                result = dlc_test.evaluate(
+                    input_fn=lambda params: eval_input_fn(params["batch_size"], params['width'], params['height']), 
+                    steps=test_count//8+1)
+                print(result)
+        else:
+            r = list(range(last_num+eval_iter,max_iter,eval_iter))
+            r += [max_iter]
+            for i in sorted(r):
+                dlc.train(input_fn=lambda:train_input_fn(cfg.batch_size), max_steps=i)
+                result = dlc_test.evaluate(
+                    input_fn=lambda: eval_input_fn(cfg.batch_size, test_width, test_height), 
+                    steps=test_count)
+                print(result)
+    except KeyboardInterrupt:
+        pass
+ 
+    if project_path != trainbase_path:
+        print('copy back training results...')
+        resultto_path = str(Path(config_yaml).parents[0])
+        resultfrom_path = resultto_path.replace(project_path, trainbase_path)
+        def cp(base):
+            for copy_file in tf.io.gfile.glob(os.path.join(base, '*')):
+                if tf.io.gfile.isdir(copy_file):
+                    output_path = copy_file.replace(trainbase_path, project_path)
+                    tf.io.gfile.makedirs(output_path)
+                    cp(copy_file)
+                else:
+                    output_path = copy_file.replace(trainbase_path, project_path)
+                    tf.io.gfile.copy(copy_file, output_path, overwrite=True)
+        cp(resultfrom_path)
+
     #return to original path.
     os.chdir(str(start_path))
 

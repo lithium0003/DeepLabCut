@@ -19,7 +19,7 @@ class VideoProcessor(object):
     
     sh and sw are the output height and width respectively.
     '''
-    def __init__(self,fname='',sname='', nframes = -1, fps = 30,codec='X264',sh='',sw=''):
+    def __init__(self,fname='',sname='', nframes = -1, fps = 30,codec='X264',sh='',sw='',create_video=True):
         self.fname = fname
         self.sname = sname
         self.nframes = nframes
@@ -43,7 +43,11 @@ class VideoProcessor(object):
                 else:
                     self.sw=sw
                     self.sh=sh
-                self.svid = self.create_video()
+
+                if create_video:
+                    self.svid = self.create_video()
+                else:
+                    self.svid = None
 
         except Exception as ex:
             print('Error: %s', ex)
@@ -140,6 +144,8 @@ class VideoProcessorCV(VideoProcessor):
         return np.flip(self.vid.read()[1],2)
     
     def save_frame(self,frame):
+        if not self.svid:
+            self.svid = self.create_video()
         self.svid.write(np.flip(frame,2))
     
     def close(self):

@@ -12,24 +12,15 @@ Licensed under GNU Lesser General Public License v3.0
 import os
 import argparse
 
+from deeplabcut.pose_estimation_tensorflow.dataset.factory import create as create_dataset
+from deeplabcut.pose_estimation_tensorflow.nnet.net_factory import pose_net
+
 # Dependencies for anaysis
 import pickle
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
-
-def pairwisedistances(DataCombined,scorer1,scorer2,pcutoff=-1,bodyparts=None):
-    ''' Calculates the pairwise Euclidean distance metric over body parts vs. images'''
-    mask=DataCombined[scorer2].xs('likelihood',level=1,axis=1)>=pcutoff
-    if bodyparts==None:
-            Pointwisesquareddistance=(DataCombined[scorer1]-DataCombined[scorer2])**2
-            RMSE=np.sqrt(Pointwisesquareddistance.xs('x',level=1,axis=1)+Pointwisesquareddistance.xs('y',level=1,axis=1)) #Euclidean distance (proportional to RMSE)
-            return RMSE,RMSE[mask]
-    else:
-            Pointwisesquareddistance=(DataCombined[scorer1][bodyparts]-DataCombined[scorer2][bodyparts])**2
-            RMSE=np.sqrt(Pointwisesquareddistance.xs('x',level=1,axis=1)+Pointwisesquareddistance.xs('y',level=1,axis=1)) #Euclidean distance (proportional to RMSE)
-            return RMSE,RMSE[mask]
 
 def evaluate_network(config,Shuffles=[1],plotting = None,show_errors = True,comparisonbodyparts="all",gputouse=None):
     """
@@ -75,19 +66,18 @@ def evaluate_network(config,Shuffles=[1],plotting = None,show_errors = True,comp
     from deeplabcut.pose_estimation_tensorflow.dataset.pose_dataset import data_to_input
     from deeplabcut.utils import auxiliaryfunctions, visualization
     import tensorflow as tf
-
-    if 'TF_CUDNN_USE_AUTOTUNE' in os.environ:
-        del os.environ['TF_CUDNN_USE_AUTOTUNE'] #was potentially set during training
-
     vers = (tf.__version__).split('.')
     if int(vers[0])==1 and int(vers[1])>12:
         TF=tf.compat.v1
     else:
         TF=tf
 
-    TF.reset_default_graph()
+    tpu = os.getenv('TPU', False)
+    if 'TF_CUDNN_USE_AUTOTUNE' in os.environ:
+        del os.environ['TF_CUDNN_USE_AUTOTUNE'] #was potentially set during training
 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' #
+    TF.logging.set_verbosity(TF.logging.WARN)
 #    tf.logging.set_verbosity(tf.logging.WARN)
 
     start_path=os.getcwd()
@@ -96,128 +86,226 @@ def evaluate_network(config,Shuffles=[1],plotting = None,show_errors = True,comp
     if gputouse is not None: #gpu selectinon
             os.environ['CUDA_VISIBLE_DEVICES'] = str(gputouse)
 
-    # Loading human annotatated data
-    trainingsetfolder=auxiliaryfunctions.GetTrainingSetFolder(cfg)
-    Data=pd.read_hdf(os.path.join(cfg["project_path"],str(trainingsetfolder),'CollectedData_' + cfg["scorer"] + '.h5'),'df_with_missing')
+
+    project_path = cfg['project_path']
+    trainbase_path = cfg['train_base_path']
+
     # Get list of body parts to evaluate network for
     comparisonbodyparts=auxiliaryfunctions.IntersectionofBodyPartsandOnesGivenbyUser(cfg,comparisonbodyparts)
+    cmpbp_idx = np.array([cfg['bodyparts'].index(i) for i in comparisonbodyparts])
     # Make folder for evaluation
-    auxiliaryfunctions.attempttomakefolder(str(cfg["project_path"]+"/evaluation-results/"))
+    auxiliaryfunctions.attempttomakefolder(str(project_path+"/evaluation-results/"))
     for shuffle in Shuffles:
         for trainFraction in cfg["TrainingFraction"]:
             ##################################################
             # Load and setup CNN part detector
             ##################################################
-            datafn,metadatafn=auxiliaryfunctions.GetDataandMetaDataFilenames(trainingsetfolder,trainFraction,shuffle,cfg)
-            modelfolder=os.path.join(cfg["project_path"],str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
-            path_test_config = Path(modelfolder) / 'test' / 'pose_cfg.yaml'
+            #datafn,metadatafn=auxiliaryfunctions.GetDataandMetaDataFilenames(trainingsetfolder,trainFraction,shuffle,cfg)
+            modelfolder=os.path.join(trainbase_path,str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
+            orgmodelfolder=os.path.join(project_path,str(auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)))
+            path_test_config = Path(orgmodelfolder) / 'test' / 'pose_cfg.yaml'
             # Load meta data
-            data, trainIndices, testIndices, trainFraction=auxiliaryfunctions.LoadMetadata(os.path.join(cfg["project_path"],metadatafn))
+            #data, trainIndices, testIndices, trainFraction=auxiliaryfunctions.LoadMetadata(os.path.join(cfg["project_path"],metadatafn))
 
             try:
+                print(str(path_test_config))
                 dlc_cfg = load_config(str(path_test_config))
             except FileNotFoundError:
                 raise FileNotFoundError("It seems the model for shuffle %s and trainFraction %s does not exist."%(shuffle,trainFraction))
 
+            if project_path != trainbase_path:
+                print('copy to training folder...')
+                if not tf.io.gfile.exists(dlc_cfg['test_set']):
+                    tf.io.gfile.copy(dlc_cfg['test_set'].replace(trainbase_path, project_path), dlc_cfg['test_set'])
+                if not tf.io.gfile.exists(dlc_cfg['train_set']):
+                    tf.io.gfile.copy(dlc_cfg['train_set'].replace(trainbase_path, project_path), dlc_cfg['train_set'])
+                resultfrom_path = os.path.join(str(orgmodelfolder), 'train')
+                resultto_path = resultfrom_path.replace(project_path, trainbase_path)
+                def cp(base):
+                    for copy_file in tf.io.gfile.glob(os.path.join(base, '*')):
+                        if tf.io.gfile.isdir(copy_file):
+                            output_path = copy_file.replace(project_path, trainbase_path)
+                            tf.io.gfile.makedirs(output_path)
+                            cp(copy_file)
+                        else:
+                            output_path = copy_file.replace(project_path, trainbase_path)
+                            if not tf.io.gfile.exists(output_path):
+                                tf.io.gfile.copy(copy_file, output_path)
+                cp(resultfrom_path)
+
             #change batch size, if it was edited during analysis!
             dlc_cfg['batch_size']=1 #in case this was edited for analysis.
             #Create folder structure to store results.
-            evaluationfolder=os.path.join(cfg["project_path"],str(auxiliaryfunctions.GetEvaluationFolder(trainFraction,shuffle,cfg)))
+            trainpath = os.path.join(str(modelfolder), 'train')
+            evaluationfolder=os.path.join(project_path,str(auxiliaryfunctions.GetEvaluationFolder(trainFraction,shuffle,cfg)))
             auxiliaryfunctions.attempttomakefolder(evaluationfolder,recursive=True)
             #path_train_config = modelfolder / 'train' / 'pose_cfg.yaml'
 
-            # Check which snapshots are available and sort them by # iterations
-            Snapshots = np.array([fn.split('.')[0]for fn in os.listdir(os.path.join(str(modelfolder), 'train'))if "index" in fn])
-            try: #check if any where found?
-              Snapshots[0]
-            except IndexError:
-              raise FileNotFoundError("Snapshots not found! It seems the dataset for shuffle %s and trainFraction %s is not trained.\nPlease train it before evaluating.\nUse the function 'train_network' to do so."%(shuffle,trainFraction))
+            model_fn = lambda features, labels, mode, params: pose_net(dlc_cfg).model_fn(features, labels, mode, params)
+    
+            w1, h1, test_count = create_dataset(dlc_cfg).get_image_size('test')
+            w2, h2, train_count = create_dataset(dlc_cfg).get_image_size('train')
+            im_width = max(w1, w2)
+            im_height = max(h1, h2)
+            if tpu:
+                if os.getenv('COLAB_TPU_ADDR', None):
+                    tpu_grpc_url = "grpc://"+os.environ["COLAB_TPU_ADDR"]
+                    tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver(tpu_grpc_url)
+                else:
+                    tpu_cluster_resolver = TF.distribute.cluster_resolver.TPUClusterResolver()
 
-            increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
-            Snapshots = Snapshots[increasing_indices]
-
-            if cfg["snapshotindex"] == -1:
-                snapindices = [-1]
-            elif cfg["snapshotindex"] == "all":
-                snapindices = range(len(Snapshots))
-            elif cfg["snapshotindex"]<len(Snapshots):
-                snapindices=[cfg["snapshotindex"]]
+                run_config = TF.estimator.tpu.RunConfig(
+                        cluster=tpu_cluster_resolver,
+                        session_config=TF.ConfigProto(
+                            allow_soft_placement=True, log_device_placement=True),
+                            tpu_config=TF.estimator.tpu.TPUConfig(
+                                iterations_per_loop='2m',
+                            ),
+                        )
+                dlc = TF.estimator.tpu.TPUEstimator(
+                        model_fn=model_fn,
+                        model_dir=trainpath,
+                        use_tpu=True,
+                        train_batch_size=dlc_cfg.batch_size*8,
+                        eval_batch_size=dlc_cfg.batch_size*8,
+                        predict_batch_size=dlc_cfg.batch_size*8,
+                        params={
+                            'tpu': tpu,
+                            'width': im_width,
+                            'height': im_height,
+                            'stride': dlc_cfg.stride,
+                            'num_outputs': 1,
+                            },
+                        config=run_config)
             else:
-                print("Invalid choice, only -1 (last), any integer up to last, or all (as string)!")
+                dlc = TF.estimator.Estimator(
+                        model_fn=model_fn,
+                        model_dir=trainpath,
+                        params={
+                            'tpu': tpu,
+                            'width': im_width,
+                            'height': im_height,
+                            'stride': dlc_cfg.stride,
+                            'num_outputs': 1,
+                            },
+                        )
 
-            final_result=[]
-            ##################################################
-            # Compute predictions over images
-            ##################################################
-            for snapindex in snapindices:
-                dlc_cfg['init_weights'] = os.path.join(str(modelfolder),'train',Snapshots[snapindex]) #setting weights to corresponding snapshot.
-                trainingsiterations = (dlc_cfg['init_weights'].split(os.sep)[-1]).split('-')[-1] #read how many training siterations that corresponds to.
+            lastckpt = dlc.latest_checkpoint()
+            if lastckpt:
+                ckpt_iter = int(lastckpt.split('-')[-1])
+            else:
+                ckpt_iter = 0
 
-                #name for deeplabcut net (based on its parameters)
-                DLCscorer = auxiliaryfunctions.GetScorerName(cfg,shuffle,trainFraction,trainingsiterations)
-                print("Running ", DLCscorer, " with # of trainingiterations:", trainingsiterations)
-                resultsfilename=os.path.join(str(evaluationfolder),DLCscorer + '-' + Snapshots[snapindex]+  '.h5')
-                try:
-                    DataMachine = pd.read_hdf(resultsfilename,'df_with_missing')
-                    print("This net has already been evaluated!")
-                except FileNotFoundError:
-                    # Specifying state of model (snapshot / training state)
-                    sess, inputs, outputs = ptf_predict.setup_pose_prediction(dlc_cfg)
+            def predict_train_input_fn(batch_size=1, width=-1, height=-1):
+                print('batch_size', batch_size)
+                dataset = create_dataset(dlc_cfg).load_predict_dataset(width, height, 'train')
+                return dataset.batch(batch_size).prefetch(batch_size)
 
-                    Numimages = len(Data.index)
-                    PredicteData = np.zeros((Numimages,3 * len(dlc_cfg['all_joints_names'])))
-                    print("Analyzing data...")
-                    for imageindex, imagename in tqdm(enumerate(Data.index)):
-                        image = io.imread(os.path.join(cfg['project_path'],imagename),mode='RGB')
-                        image = skimage.color.gray2rgb(image)
-                        image_batch = data_to_input(image)
+            def predict_test_input_fn(batch_size=1, width=-1, height=-1):
+                print('batch_size', batch_size)
+                dataset = create_dataset(dlc_cfg).load_predict_dataset(width, height, 'test')
+                return dataset.batch(batch_size).prefetch(batch_size)
 
-                        # Compute prediction with the CNN
-                        outputs_np = sess.run(outputs, feed_dict={inputs: image_batch})
-                        scmap, locref = ptf_predict.extract_cnn_output(outputs_np, dlc_cfg)
+            final_result = []
+            try:
+                train_predicted = np.zeros([train_count, 3*len(dlc_cfg['all_joints_names'])])
+                test_predicted = np.zeros([train_count, 3*len(dlc_cfg['all_joints_names'])])
+                if tpu:
+                    train_predictions = dlc.predict(
+                        input_fn=lambda params: predict_train_input_fn(params["batch_size"], params['width'], params['height']))
 
-                        # Extract maximum scoring location from the heatmap, assume 1 person
-                        pose = ptf_predict.argmax_pose_predict(scmap, locref, dlc_cfg.stride)
-                        PredicteData[imageindex, :] = pose.flatten()  # NOTE: thereby     cfg_test['all_joints_names'] should be same order as bodyparts!
+                    image_count = 0
+                    for predict in train_predictions:
+                        train_predicted[image_count, 0::3] = predict['x'].flatten()
+                        train_predicted[image_count, 1::3] = predict['y'].flatten()
+                        train_predicted[image_count, 2::3] = predict['p'].flatten()
+                        image_count += 1
+                    
+                    test_predictions = dlc.predict(
+                        input_fn=lambda params: predict_test_input_fn(params["batch_size"], params['width'], params['height']))
 
-                    sess.close() #closes the current tf session
+                    image_count = 0
+                    for predict in test_predictions:
+                        test_predicted[image_count, 0::3] = predict['x'].flatten()
+                        test_predicted[image_count, 1::3] = predict['y'].flatten()
+                        test_predicted[image_count, 2::3] = predict['p'].flatten()
+                        image_count += 1
+                else:
+                    train_predictions = dlc.predict(
+                        input_fn=lambda: predict_train_input_fn(dlc_cfg.batch_size, im_width, im_height))
 
-                    index = pd.MultiIndex.from_product(
-                        [[DLCscorer], dlc_cfg['all_joints_names'], ['x', 'y', 'likelihood']],
-                        names=['scorer', 'bodyparts', 'coords'])
+                    image_count = 0
+                    for predict in train_predictions:
+                        train_predicted[image_count, 0::3] = predict['x'].flatten()
+                        train_predicted[image_count, 1::3] = predict['y'].flatten()
+                        train_predicted[image_count, 2::3] = predict['p'].flatten()
+                        image_count += 1
+                    
+                    test_predictions = dlc.predict(
+                        input_fn=lambda: predict_test_input_fn(dlc_cfg.batch_size, im_width, im_height))
 
-                    # Saving results
-                    DataMachine = pd.DataFrame(PredicteData, columns=index, index=Data.index.values)
-                    DataMachine.to_hdf(resultsfilename,'df_with_missing',format='table',mode='w')
+                    image_count = 0
+                    for predict in test_predictions:
+                        test_predicted[image_count, 0::3] = predict['x'].flatten()
+                        test_predicted[image_count, 1::3] = predict['y'].flatten()
+                        test_predicted[image_count, 2::3] = predict['p'].flatten()
+                        image_count += 1
+                    
+                if plotting == True:
+                    print("Plotting...")
+                    colors = visualization.get_cmap(len(comparisonbodyparts),name=cfg['colormap'])
+                    foldername=os.path.join(str(evaluationfolder),'LabeledImages_' + str(ckpt_iter))
+                    auxiliaryfunctions.attempttomakefolder(foldername)
+                
+                def process_data(predicted, dataset, im_count, isTrain):
+                    with TF.Session() as sess:
+                        count = 0
+                        RMSE = np.zeros([im_count, len(dlc_cfg['all_joints_names'])])
+                        RMSEpcutoff = np.zeros([im_count, len(dlc_cfg['all_joints_names'])])
+                        data = TF.data.make_one_shot_iterator(dataset).get_next()
+                        while True:
+                            try:
+                                im, name, bodypart = sess.run(data)
+                                name = name.decode('utf-8')
+                            except tf.errors.OutOfRangeError:
+                                break
 
-                    print("Done and results stored for snapshot: ", Snapshots[snapindex])
-                    DataCombined = pd.concat([Data.T, DataMachine.T], axis=0).T
-                    RMSE,RMSEpcutoff = pairwisedistances(DataCombined, cfg["scorer"], DLCscorer,cfg["pcutoff"],comparisonbodyparts)
-                    testerror = np.nanmean(RMSE.iloc[testIndices].values.flatten())
-                    trainerror = np.nanmean(RMSE.iloc[trainIndices].values.flatten())
-                    testerrorpcutoff = np.nanmean(RMSEpcutoff.iloc[testIndices].values.flatten())
-                    trainerrorpcutoff = np.nanmean(RMSEpcutoff.iloc[trainIndices].values.flatten())
-                    results = [trainingsiterations,int(100 * trainFraction),shuffle,np.round(trainerror,2),np.round(testerror,2),cfg["pcutoff"],np.round(trainerrorpcutoff,2), np.round(testerrorpcutoff,2)]
-                    final_result.append(results)
+                            def calc_distance(labeled, predict):
+                                mask = predict[:,2] < cfg["pcutoff"]
+                                rmse = np.sqrt((labeled[:,0] - predict[:,0])**2 + (labeled[:,1] - predict[:,1])**2)
+                                rmse_mask = rmse
+                                rmse_mask[mask] = float('nan')
+                                return rmse.flatten(), rmse_mask.flatten()
+                            
+                            pred = predicted[count, :].reshape((-1,3))
+                            RMSE[count,:],RMSEpcutoff[count,:] = calc_distance(bodypart, pred)
+                            if plotting == True:
+                                visualization.PlottingandSaveLabeledFrame(name,im,bodypart,pred,isTrain,
+                                        cfg,colors,cmpbp_idx,foldername)
+                            count += 1
+                        return np.nanmean(RMSE[:,cmpbp_idx].flatten()), np.nanmean(RMSEpcutoff[:,cmpbp_idx].flatten())
 
-                    if show_errors == True:
-                            print("Results for",trainingsiterations," training iterations:", int(100 * trainFraction), shuffle, "train error:",np.round(trainerror,2), "pixels. Test error:", np.round(testerror,2)," pixels.")
-                            print("With pcutoff of", cfg["pcutoff"]," train error:",np.round(trainerrorpcutoff,2), "pixels. Test error:", np.round(testerrorpcutoff,2), "pixels")
-                            print("Thereby, the errors are given by the average distances between the labels by DLC and the scorer.")
+                train_dataset = create_dataset(dlc_cfg).load_plot_dataset(im_width, im_height, 'train')
+                trainerror, trainerrorpcutoff = process_data(train_predicted, train_dataset, train_count, True)
 
+                test_dataset = create_dataset(dlc_cfg).load_plot_dataset(im_width, im_height, 'test')
+                testerror, testerrorpcutoff = process_data(test_predicted, test_dataset, test_count, False)
+   
+                results = [ckpt_iter,int(100 * trainFraction),shuffle,np.round(trainerror,2),np.round(testerror,2),cfg["pcutoff"],np.round(trainerrorpcutoff,2), np.round(testerrorpcutoff,2)]
+                final_result.append(results)
 
-                    if plotting == True:
-                        print("Plotting...")
-                        colors = visualization.get_cmap(len(comparisonbodyparts),name=cfg['colormap'])
+                if show_errors == True:
+                    print("Results for",ckpt_iter," training iterations:", int(100 * trainFraction), shuffle, "train error:",np.round(trainerror,2), "pixels. Test error:", np.round(testerror,2)," pixels.")
+                    print("With pcutoff of", cfg["pcutoff"]," train error:",np.round(trainerrorpcutoff,2), "pixels. Test error:", np.round(testerrorpcutoff,2), "pixels")
+                    print("Thereby, the errors are given by the average distances between the labels by DLC and the scorer.")
 
-                        foldername=os.path.join(str(evaluationfolder),'LabeledImages_' + DLCscorer + '_' + Snapshots[snapindex])
-                        auxiliaryfunctions.attempttomakefolder(foldername)
-                        NumFrames=np.size(DataCombined.index)
-                        for ind in np.arange(NumFrames):
-                            visualization.PlottingandSaveLabeledFrame(DataCombined,ind,trainIndices,cfg,colors,comparisonbodyparts,DLCscorer,foldername)
-
-                    TF.reset_default_graph()
-                    #print(final_result)
+            except KeyboardInterrupt:
+                pass
+                    
+            TF.reset_default_graph()
+            
+            #print(final_result)
+            DLCscorer = auxiliaryfunctions.GetScorerName(cfg,shuffle,trainFraction,ckpt_iter)
             make_results_file(final_result,evaluationfolder,DLCscorer)
             print("The network is evaluated and the results are stored in the subdirectory 'evaluation_results'.")
             print("If it generalizes well, choose the best model for prediction and update the config file with the appropriate index for the 'snapshotindex'.\nUse the function 'analyze_video' to make predictions on new videos.")

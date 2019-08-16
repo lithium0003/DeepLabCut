@@ -220,25 +220,51 @@ def create_empty_df(dataframe,scorer,flag):
 
 def Getlistofvideos(videos,videotype):
     from random import sample
-    #checks if input is a directory
-    if [os.path.isdir(i) for i in videos] == [True]:#os.path.isdir(video)==True:
-        """
-        Analyzes all the videos in the directory.
-        """
-        
-        print("Analyzing all the videos in the directory")
-        videofolder= videos[0]
-        os.chdir(videofolder)
-        videolist=[fn for fn in os.listdir(os.curdir) if (videotype in fn) and ('labeled.mp4' not in fn)] #exclude labeled-videos!
-        Videos = sample(videolist,len(videolist)) # this is useful so multiple nets can be used to analzye simultanously
-    else:
-        if isinstance(videos,str):
-            if os.path.isfile(videos): # #or just one direct path!
-                Videos=[v for v in videos if os.path.isfile(v) and ('labeled.mp4' not in v)]
-            else:
-                Videos=[]
+    import tensorflow as tf
+    # for tpu
+    if videotype == 'tfrecord':
+        print("Analyzing tfrecord")
+        if [tf.io.gfile.isdir(i) for i in videos] == [True]:
+            videofolder= videos[0]
+            dirlist=[fn for fn in tf.io.gfile.listdir(videofolder) if tf.io.gfile.isdir(os.path.join(videofolder, fn))]
+            Videos = []
+            for d in dirlist:
+                files = [fn for fn in tf.io.gfile.listdir(os.path.join(videofolder,d)) if (videotype in fn)]
+                if len(files) > 0:
+                    Videos.append(os.path.join(videofolder, d, '*.tfrecord'))
         else:
-            Videos=[v for v in videos if os.path.isfile(v) and ('labeled.mp4' not in v)]
+            if isinstance(videos, str):
+                if videos.endswith('.tfrecord'):
+                    Videos = [videos]
+                else:
+                    Videos = []
+            else:
+                Videos = []
+                for v in videos:
+                    if tf.io.gfile.isdir(v):
+                        files = [fn for fn in tf.io.gfile.listdir(v) if (videotype in fn)]
+                        if len(files) > 0:
+                            Videos.append(os.path.join(v,'*.tfrecord'))
+    else:
+        #checks if input is a directory
+        if [os.path.isdir(i) for i in videos] == [True]:#os.path.isdir(video)==True:
+            """
+            Analyzes all the videos in the directory.
+            """
+            
+            print("Analyzing all the videos in the directory")
+            videofolder= videos[0]
+            os.chdir(videofolder)
+            videolist=[fn for fn in os.listdir(os.curdir) if (videotype in fn) and ('labeled.mp4' not in fn)] #exclude labeled-videos!
+            Videos = sample(videolist,len(videolist)) # this is useful so multiple nets can be used to analzye simultanously
+        else:
+            if isinstance(videos,str):
+                if os.path.isfile(videos): # #or just one direct path!
+                    Videos=[v for v in videos if os.path.isfile(v) and ('labeled.mp4' not in v)]
+                else:
+                    Videos=[]
+            else:
+                Videos=[v for v in videos if os.path.isfile(v) and ('labeled.mp4' not in v)]
     return Videos
 
 def SaveData(PredicteData, metadata, dataname, pdindex, imagenames,save_as_csv):
@@ -345,7 +371,7 @@ def GetScorerName(cfg,shuffle,trainFraction,trainingsiterations='unknown'):
             snapshotindex=cfg['snapshotindex']
 
         modelfolder=os.path.join(cfg["project_path"],str(GetModelFolder(trainFraction,shuffle,cfg)),'train')
-        Snapshots = np.array([fn.split('.')[0]for fn in os.listdir(modelfolder) if "index" in fn])
+        Snapshots = np.array([fn.split('.')[-2]for fn in os.listdir(modelfolder) if "index" in fn])
         increasing_indices = np.argsort([int(m.split('-')[1]) for m in Snapshots])
         Snapshots = Snapshots[increasing_indices]
         #dlc_cfg = read_config(os.path.join(modelfolder,'pose_cfg.yaml'))

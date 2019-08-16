@@ -645,6 +645,8 @@ def create_training_dataset_org(config,num_shuffles=1,Shuffles=None,windows2linu
                 print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")
 
 def create_training_dataset(config,num_shuffles=1,Shuffles=None):
+    from PIL import Image
+
     cfg = auxiliaryfunctions.read_config(config)
     project_path = cfg['project_path']
     trainbase_path = cfg['train_base_path']
@@ -663,29 +665,14 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None):
 
     # copy pretrained weight to trainging work space
     pretrained_path = os.path.join(trainbase_path, 'pretrained', os.path.basename(model_path))
-    pretrained = tf.io.read_file(model_path)
-    writer = tf.io.write_file(pretrained_path, pretrained)
-    with tf.compat.v1.Session() as sess:
-        sess.run(writer)
+    if not tf.io.gfile.exists(pretrained_path):
+        tf.io.gfile.makedirs(os.path.join(trainbase_path, 'pretrained'))
+        tf.io.gfile.copy(model_path, pretrained_path)
 
     if Shuffles==None:
         Shuffles=range(1,num_shuffles+1,1)
     else:
         Shuffles=[i for i in Shuffles if isinstance(i,int)]
-
-    # copy image files to trainging work space
-    if project_path != trainbase_path:
-        with tf.compat.v1.Session() as sess:
-            labelfiles = glob.glob(os.path.join(project_path, 'labeled-data/*/CollectedData_%s.csv'%cfg['scorer']))
-            for labelfile in labelfiles:
-                image_files = glob.glob(os.path.join(os.path.dirname(labelfile),'img*.png'))
-                regex = re.compile(r'img\d+\.png$')
-                image_files = list(filter(regex.search, image_files))
-                for image_file in image_files:
-                    output_path = image_file.replace(os.path.join(project_path,'labeled-data'), os.path.join(trainbase_path,'labeled-data'))
-                    org_image = tf.io.read_file(image_file)
-                    writer = tf.io.write_file(output_path, org_image)
-                    sess.run(writer)
 
     TrainingFraction = cfg['TrainingFraction']
     for shuffle in Shuffles: # Creating shuffles starting from 1
@@ -696,51 +683,86 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None):
             csvdata = files_ds.interleave(lambda f: tf.data.TextLineDataset(f).skip(3), cycle_length=1)
 
             def parse_line(line):
-              part = ['']
-              part += [tf.constant(float('nan'), dtype=tf.float32) for _ in range(bodypart_num * 2)]
-              fields = tf.io.decode_csv(line, part)
-              filename = tf.strings.regex_replace(fields[0],'\\\\','/')
-              bodypart = tf.reshape(fields[1:], [-1,2])
-              return filename, bodypart
+                part = ['']
+                part += [tf.constant(float('nan'), dtype=tf.float32) for _ in range(bodypart_num * 2)]
+                fields = tf.io.decode_csv(line, part)
+                filename = tf.strings.regex_replace(fields[0],'\\\\','/')
+                bodypart = tf.reshape(fields[1:], [-1,2])
+                return filename, bodypart
 
             def filter_item(filename, bodypart):
-              return tf.math.logical_not(tf.math.reduce_all(tf.math.reduce_any(tf.math.is_nan(bodypart), axis=1)))
- 
+                return tf.math.logical_not(tf.math.reduce_all(tf.math.reduce_any(tf.math.is_nan(bodypart), axis=1)))
+
+            def load_image(filename, bodypart):
+                filepath = tf.strings.join([project_path, filename], separator='/')
+                image_raw = tf.io.read_file(filepath)
+                return filename, bodypart, image_raw
+
+
             data = csvdata.map(parse_line).filter(filter_item)
+            datacounter = tf.compat.v1.data.make_one_shot_iterator(data).get_next()
+            data_count = 0
+            with tf.compat.v1.Session() as sess:
+                while True:
+                    try:
+                        filename, bodypart = sess.run(datacounter)
+                        data_count += 1
+                    except tf.errors.OutOfRangeError:
+                        break
+           
+            data = data.map(load_image)
             data = tf.compat.v1.data.make_one_shot_iterator(data)
             data = data.get_next()
 
-            def make_example(filename, bodypart):
-              return tf.train.Example(features=tf.train.Features(feature={
+            def make_example(filename, bodypart, width, height, im_raw):
+                return tf.train.Example(features=tf.train.Features(feature={
                   'filepath': tf.train.Feature(bytes_list=tf.train.BytesList(value=[filename])),
                   'bodypart': tf.train.Feature(float_list=tf.train.FloatList(value=bodypart.flatten())),
-              }))
+                  'width': tf.train.Feature(int64_list=tf.train.Int64List(value=[width])),
+                  'height': tf.train.Feature(int64_list=tf.train.Int64List(value=[height])),
+                  'im_raw': tf.train.Feature(bytes_list=tf.train.BytesList(value=[im_raw])),
+                }))
 
             modelfoldername=auxiliaryfunctions.GetModelFolder(trainFraction,shuffle,cfg)
+            auxiliaryfunctions.attempttomakefolder(Path(config).parents[0] / modelfoldername,recursive=True)
+            auxiliaryfunctions.attempttomakefolder(str(Path(config).parents[0] / modelfoldername)+ '/'+ '/train')
+            auxiliaryfunctions.attempttomakefolder(str(Path(config).parents[0] / modelfoldername)+ '/'+ '/test')
             path_train_config = str(os.path.join(project_path,Path(modelfoldername),'train','pose_cfg.yaml'))
             path_test_config = str(os.path.join(project_path,Path(modelfoldername),'test','pose_cfg.yaml'))
 
             datafn=os.path.join(str(trainingsetfolder) ,cfg["Task"] + "_" + cfg["scorer"] + str(int(100 * trainFraction)) + "shuffle" + str(shuffle))
             test_record = os.path.join(trainbase_path, datafn, 'test.tfrecord')
             train_record = os.path.join(trainbase_path, datafn, 'train.tfrecord')
+            otest_record = os.path.join(project_path, datafn, 'test.tfrecord')
+            otrain_record = os.path.join(project_path, datafn, 'train.tfrecord')
+            os.makedirs(os.path.join(project_path, datafn), exist_ok=True)
             if not trainbase_path.startswith('gs://'):
                 os.makedirs(os.path.join(trainbase_path, datafn), exist_ok=True)
                 os.makedirs(os.path.join(trainbase_path,Path(modelfoldername),'train'), exist_ok=True)
                 os.makedirs(os.path.join(trainbase_path,Path(modelfoldername),'test'), exist_ok=True)
 
-            with tf.io.TFRecordWriter(test_record) as writer2:
-              with tf.io.TFRecordWriter(train_record) as writer1:
-                with tf.compat.v1.Session() as sess:
-                  while True:
-                    try:
-                      filename, bodypart = sess.run(data)
-                      ex = make_example(filename, bodypart)
-                      if np.random.rand() < trainFraction:
-                        writer1.write(ex.SerializeToString())
-                      else:
-                        writer2.write(ex.SerializeToString())
-                    except tf.errors.OutOfRangeError:
-                      break
+            train_count = int(data_count * trainFraction)
+            tindex = np.random.permutation(data_count)
+            with tf.io.TFRecordWriter(otest_record) as writer2:
+                with tf.io.TFRecordWriter(otrain_record) as writer1:
+                    with tf.compat.v1.Session() as sess:
+                        for idx in range(data_count):
+                            try:
+                                filename, bodypart, im_raw = sess.run(data)
+                                im = Image.open(os.path.join(project_path, filename.decode('utf-8')))
+                                w, h = im.size
+                                ex = make_example(filename, bodypart, w, h, im_raw)
+                                if tindex[idx] < train_count:
+                                    writer1.write(ex.SerializeToString())
+                                else:
+                                    writer2.write(ex.SerializeToString())
+                            except tf.errors.OutOfRangeError:
+                                break
+            
+            if project_path != trainbase_path:
+                print('copy to training folder...')
+                tf.io.gfile.copy(otrain_record, train_record, overwrite=True)
+                tf.io.gfile.copy(otest_record, test_record, overwrite=True)
 
             items2change = {
                 "train_set": train_record,
@@ -757,7 +779,7 @@ def create_training_dataset(config,num_shuffles=1,Shuffles=None):
             keys2save = [
                 "train_set", "test_set", "num_joints", "all_joints", "all_joints_names",
                 "net_type", 'init_weights', 'train_base_path', 'global_scale', 'location_refinement',
-                'locref_stdev'
+                'locref_stdev', 'pos_dist_thresh',
             ]
             MakeTest_pose_yaml(trainingdata, keys2save,path_test_config)
             print("The training dataset is successfully created. Use the function 'train_network' to start training. Happy training!")

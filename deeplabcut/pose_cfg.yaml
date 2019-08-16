@@ -85,5 +85,13 @@ display_iters: 1000
 save_iters: 50000
 
 # training image size must be fixed on TPU
-train_width: 480
-train_height: 480
+train_width: 400
+train_height: 400
+
+# random rotation image ratio
+random_rotation: 0.5
+
+# image random crop parameters
+# for tf.image.sample_distorted_bounding_box 
+bounding_joint: 30
+min_object_covered: 0.8
