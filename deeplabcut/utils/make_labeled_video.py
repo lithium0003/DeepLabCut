@@ -433,11 +433,14 @@ def create_labeled_video(config,videos,videotype='avi',shuffle=1,trainingsetinde
         else:
             videooutname=os.path.join(vname + DLCscorer+'_labeled.mp4')
         
-        if os.path.isfile(os.path.join(str(videofolder),vname + DLCscorer+'_labeled.mp4')):
+        if os.path.isfile(os.path.join(str(videofolder), videooutname):
             print("Labeled video already created.")
         else:
             print("Loading ", video, "and data.")
-            dataname = os.path.join(str(videofolder),vname+DLCscorer + '.h5')
+            if filtered == True:
+                dataname = os.path.join(str(videofolder),vname+DLCscorer + 'filtered.h5')
+            else:
+                dataname = os.path.join(str(videofolder),vname+DLCscorer + '.h5')
             try:
                 Dataframe = pd.read_hdf(dataname)
                 metadata=auxiliaryfunctions.LoadVideoMetadata(dataname)
