@@ -433,7 +433,7 @@ def create_labeled_video(config,videos,videotype='avi',shuffle=1,trainingsetinde
         else:
             videooutname=os.path.join(vname + DLCscorer+'_labeled.mp4')
         
-        if os.path.isfile(os.path.join(str(videofolder), videooutname):
+        if os.path.isfile(os.path.join(str(videofolder), videooutname)):
             print("Labeled video already created.")
         else:
             print("Loading ", video, "and data.")
