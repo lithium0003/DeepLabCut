@@ -93,5 +93,5 @@ random_rotation: 0.5
 
 # image random crop parameters
 # for tf.image.sample_distorted_bounding_box 
-bounding_joint: 30
-min_object_covered: 0.8
+bounding_joint: 100
+min_object_covered: 0.5
