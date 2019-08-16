@@ -439,11 +439,13 @@ def create_labeled_video(config,videos,videotype='avi',shuffle=1,trainingsetinde
             print("Loading ", video, "and data.")
             if filtered == True:
                 dataname = os.path.join(str(videofolder),vname+DLCscorer + 'filtered.h5')
+                datanamebase = os.path.join(str(videofolder),vname+DLCscorer + '.h5')
             else:
                 dataname = os.path.join(str(videofolder),vname+DLCscorer + '.h5')
+                datanamebase = os.path.join(str(videofolder),vname+DLCscorer + '.h5')
             try:
                 Dataframe = pd.read_hdf(dataname)
-                metadata=auxiliaryfunctions.LoadVideoMetadata(dataname)
+                metadata=auxiliaryfunctions.LoadVideoMetadata(datanamebase)
                 #print(metadata)
                 datanames=[dataname]
             except FileNotFoundError:
