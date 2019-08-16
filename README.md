@@ -17,4 +17,7 @@ for Google Colaboratory TPU
 * For TPU, 'analyze_videos' function are changed use tfrecord converted inputs
 * For TPU, add 'convert_analyze_videos' function for convert to tfrecord input
 * Change 'create_labeled_video' function for alpha labels marking
-  
+
+# How to use
+1. process to label_frames steps.
+1. open [Colabratory notebook](dlc_tpu.ipynb) and follow the instructions
