@@ -198,7 +198,7 @@ def train(config_yaml,displayiters,saveiters,maxiters,max_to_keep=5):
 
     try:
         if tpu:
-            max_iter = max_iter
+            max_iter = max_iter // 2
             r = list(range(last_num+eval_iter,max_iter,eval_iter))
             r += [max_iter]
             for i in sorted(r):
