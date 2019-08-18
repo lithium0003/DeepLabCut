@@ -356,7 +356,7 @@ class PoseDataset:
 
     def random_brightness(self, image, bodypart):
         image = tf.image.random_brightness(image, 63.)
-        image = tf.image.random_contrast(image, lower=0.25, upper=1.75)
+        image = tf.image.random_contrast(image, lower=0.5, upper=1.5)
         image = tf.clip_by_value(image, 0., 255.)
         return image, bodypart
 
