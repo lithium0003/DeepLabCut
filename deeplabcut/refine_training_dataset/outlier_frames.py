@@ -160,7 +160,7 @@ def extract_outlier_frames(config,videos,videotype='avi',shuffle=1,trainingsetin
                       dy=np.diff(Dataframe[scorer][bp]['y'].values[Index])
                       p=Dataframe[scorer][bp]['likelihood'].values[Index]
                       # all indices between start and stop with jump larger than epsilon (leading up to this point!)
-                      Indices.extend(np.where(((dx**2+dy**2)>epsilon**2) && (p>=p_bound))[0]+startindex+1)
+                      Indices.extend(np.where(((dx**2+dy**2)>epsilon**2) and (p>=p_bound))[0]+startindex+1)
           elif outlieralgorithm=='fitting':
               #deviation_dataname = str(Path(videofolder)/Path(dataname))
               # Calculate deviatons for video
