@@ -46,7 +46,7 @@ def extract_outlier_frames(config,videos,videotype='avi',shuffle=1,trainingsetin
     trainingsetindex: int, optional
         Integer specifying which TrainingsetFraction to use. By default the first (note that TrainingFraction is a list in config.yaml).
 
-    outlieralgorithm: 'fitting', 'jump', 'uncertain', or 'manual'
+    outlieralgorithm: 'fitting', 'jump', 'jump_with_p', 'uncertain', or 'manual'
         String specifying the algorithm used to detect the outliers. Currently, deeplabcut supports three methods + a manual GUI option. 'Fitting'
         fits a Auto Regressive Integrated Moving Average model to the data and computes the distance to the estimated data. Larger distances than
         epsilon are then potentially identified as outliers. The methods 'jump' identifies larger jumps than 'epsilon' in any body part; and 'uncertain'
@@ -153,6 +153,14 @@ def extract_outlier_frames(config,videos,videotype='avi',shuffle=1,trainingsetin
                       dy=np.diff(Dataframe[scorer][bp]['y'].values[Index])
                       # all indices between start and stop with jump larger than epsilon (leading up to this point!)
                       Indices.extend(np.where((dx**2+dy**2)>epsilon**2)[0]+startindex+1)
+          elif outlieralgorithm=='jump_with_p':
+              for bpindex,bp in enumerate(bodyparts):
+                  if bp in cfg['bodyparts']: #filter [who knows what users put in...]
+                      dx=np.diff(Dataframe[scorer][bp]['x'].values[Index])
+                      dy=np.diff(Dataframe[scorer][bp]['y'].values[Index])
+                      p=Dataframe[scorer][bp]['likelihood'].values[Index]
+                      # all indices between start and stop with jump larger than epsilon (leading up to this point!)
+                      Indices.extend(np.where(((dx**2+dy**2)>epsilon**2) && (p>=p_bound))[0]+startindex+1)
           elif outlieralgorithm=='fitting':
               #deviation_dataname = str(Path(videofolder)/Path(dataname))
               # Calculate deviatons for video
@@ -178,6 +186,8 @@ def extract_outlier_frames(config,videos,videotype='avi',shuffle=1,trainingsetin
                   print("If this list is very large, perhaps consider changing the paramters (start, stop, p_bound, comparisonbodyparts) or use a different method.")
               elif outlieralgorithm=='jump':
                   print("If this list is very large, perhaps consider changing the paramters (start, stop, epsilon, comparisonbodyparts) or use a different method.")
+              elif outlieralgorithm=='jump_with_p':
+                  print("If this list is very large, perhaps consider changing the paramters (start, stop, p_bound, epsilon, comparisonbodyparts) or use a different method.")
               elif outlieralgorithm=='fitting':
                   print("If this list is very large, perhaps consider changing the paramters (start, stop, epsilon, ARdegree, MAdegree, alpha, comparisonbodyparts) or use a different method.")
     
