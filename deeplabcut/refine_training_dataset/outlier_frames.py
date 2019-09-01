@@ -158,9 +158,9 @@ def extract_outlier_frames(config,videos,videotype='avi',shuffle=1,trainingsetin
                   if bp in cfg['bodyparts']: #filter [who knows what users put in...]
                       dx=np.diff(Dataframe[scorer][bp]['x'].values[Index])
                       dy=np.diff(Dataframe[scorer][bp]['y'].values[Index])
-                      p=Dataframe[scorer][bp]['likelihood'].values[Index]
+                      p=Dataframe[scorer][bp]['likelihood'].values[Index][:-1]
                       # all indices between start and stop with jump larger than epsilon (leading up to this point!)
-                      Indices.extend(np.where(((dx**2+dy**2)>epsilon**2) and (p>=p_bound))[0]+startindex+1)
+                      Indices.extend(np.where(np.logical_and((dx**2+dy**2)>epsilon**2, p>p_bound))[0]+startindex+1)
           elif outlieralgorithm=='fitting':
               #deviation_dataname = str(Path(videofolder)/Path(dataname))
               # Calculate deviatons for video
