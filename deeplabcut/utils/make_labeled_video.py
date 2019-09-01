@@ -122,6 +122,7 @@ def CreateVideo(clip,Dataframe,pcutoff,dotsize,colormap,alphavalue,DLCscorer,bod
                         rr, cc = circle(yc,xc,dotsize,shape=(ny,nx))
                         a = alphavalue
                         image[rr, cc, :] = a * colors[bpindex] + (1 - a) * image[rr, cc, :]
+                        frame = image.copy()
 
             return index, frame
 
